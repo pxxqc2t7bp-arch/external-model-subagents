@@ -1,0 +1,7 @@
+/target
+/bin/
+/log/
+.DS_Store
+._*
+harnesses.json
+models.json

@@ -1,0 +1,8 @@
+{
+  "codex": {
+    "litellm": ["deepseek-r1", "qwen3-coder-plus"]
+  },
+  "claude": {
+    "gateway": ["anthropic/claude-sonnet-4-6"]
+  }
+}

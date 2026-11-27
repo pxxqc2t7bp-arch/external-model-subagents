@@ -1,0 +1,22 @@
+[package]
+name = "ext-models-mcp"
+version = "2.0.0"
+edition = "2021"
+description = "Heap-bounded Rust MCP hub for orchestrating external CLI coding harnesses (Codex, Claude Code, Trae, ZCode, and custom CLIs)"
+license = "MIT"
+repository = "https://github.com/pxxqc2t7bp-arch/external-model-subagents"
+
+[[bin]]
+name = "ext-models-mcp"
+path = "src/main.rs"
+
+[dependencies]
+libc = "0.2"
+serde_json = "1.0"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

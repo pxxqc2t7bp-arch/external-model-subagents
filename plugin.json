@@ -1,0 +1,12 @@
+{
+  "name": "external-model-subagents",
+  "displayName": "External Model Subagents (Rust Hub)",
+  "version": "2.0.0",
+  "description": "Heap-bounded Rust MCP hub for orchestrating Codex, Claude Code, Trae, ZCode, and custom CLI harnesses with provider-safe routing and isolated git worktrees.",
+  "repository": "https://github.com/pxxqc2t7bp-arch/external-model-subagents",
+  "suggestedPrompts": [
+    "Check available external harnesses, providers, and models with status",
+    "Ask Codex to run an adversarial review on uncommitted git changes",
+    "Run Codex and Claude in parallel to diagnose the root cause of this bug"
+  ]
+}

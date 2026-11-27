@@ -1,0 +1,24 @@
+{
+  "harnesses": [
+    {
+      "id": "opencode",
+      "binary": "opencode",
+      "strengths": "OpenCode headless CLI agent",
+      "args": ["run", "--model", "{model}"],
+      "plan_flags": [],
+      "write_flags": [],
+      "full_flags": [],
+      "prompt_via_stdin": false
+    },
+    {
+      "id": "aider",
+      "binary": "aider",
+      "strengths": "Git-centric pair programming CLI",
+      "args": ["--yes-always", "--no-pretty", "--message", "{prompt}"],
+      "plan_flags": ["--chat-mode", "ask"],
+      "write_flags": ["--chat-mode", "code"],
+      "full_flags": ["--chat-mode", "code"],
+      "prompt_via_stdin": false
+    }
+  ]
+}

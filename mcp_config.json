@@ -1,0 +1,15 @@
+{
+  "mcpServers": {
+    "hub": {
+      "command": "/bin/sh",
+      "args": [
+        "-c",
+        "exec \"${EXT_MODELS_BIN:-$HOME/.gemini/config/plugins/external-model-subagents/bin/ext-models-mcp}\" mcp"
+      ],
+      "env": {
+        "EXT_MODELS_MAX_HEAP_MB": "16",
+        "EXT_MODELS_MAX_JOBS": "3"
+      }
+    }
+  }
+}
