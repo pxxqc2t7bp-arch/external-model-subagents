@@ -56,10 +56,13 @@ impl HarnessAdapter for DeepSeekAdapter {
         }
     }
     fn on_stdout_line(&self, line: &str, state: &mut ParseState) {
+        self.on_stdout_line_bounded(line, false, state);
+    }
+    fn on_stdout_line_bounded(&self, line: &str, truncated: bool, state: &mut ParseState) {
         if self.bin.is_some() {
             state.raw_tail.push_line(line);
         } else {
-            self.http.on_stdout_line(line, state);
+            self.http.on_stdout_line_bounded(line, truncated, state);
         }
     }
 }

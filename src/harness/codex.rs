@@ -8,7 +8,6 @@ use crate::harness::{
 use crate::sandbox::CommandSpec;
 use crate::stream::artifact_dir;
 use serde_json::Value;
-use std::path::Path;
 
 pub struct CodexAdapter;
 
@@ -143,6 +142,7 @@ impl HarnessAdapter for CodexAdapter {
             stdin_data: (!stdin_text.is_empty()).then_some(stdin_text),
             cwd: req.cwd.clone(),
             output_file: out_file,
+            temp_files: Vec::new(),
         })
     }
 
@@ -158,6 +158,9 @@ impl HarnessAdapter for CodexAdapter {
                 "notify=[]",
                 "-c",
                 "mcp_servers.computer-use.enabled=false",
+                "-c", "mcp_servers.unified-computer-use.enabled=false",
+                "-c", "mcp_servers.external-model-subagents.enabled=false",
+                "-c", "mcp_servers.ext-models-mcp.enabled=false",
             ],
         );
     }
@@ -179,9 +182,13 @@ impl HarnessAdapter for CodexAdapter {
         &self,
         caps: &CapabilityMode,
         inv: &HarnessInventory,
-        _cwd: &Path,
+        _req: &RunRequest,
         spec: &mut CommandSpec,
-    ) {
+    ) -> Result<(), String> {
+        for name in &inv.blocked_mcps {
+            let key = format!("mcp_servers.\"{}\".enabled=false", escape_toml_str(name));
+            insert_before_subcmd(&mut spec.args, &["-c", &key]);
+        }
         match caps {
             CapabilityMode::Code => {
                 // Disable both `[mcp_servers]` and `[plugins.*]` remote OAuth MCP workers in headless code runs.
@@ -221,6 +228,7 @@ impl HarnessAdapter for CodexAdapter {
                 // Keep all non-poison MCPs and plugins enabled.
             }
         }
+        Ok(())
     }
 
     fn on_stdout_line(&self, line: &str, state: &mut ParseState) {

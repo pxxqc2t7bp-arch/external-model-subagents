@@ -18,12 +18,11 @@ fn http_adapter_streams_openai_reasoning_and_never_leaks_api_key_in_argv() {
 
     let argv_file = dir.join("curl_argv.txt");
     let stdin_file = dir.join("curl_stdin.txt");
-    let env_file = dir.join("curl_env.txt");
     let fake_curl = dir.join("fake-curl");
 
-    // Fake curl captures argv, environment, and stdin (-K -), then emits DeepSeek-style SSE + HTTP 200.
+    // Fake curl checks the key is absent from its environment and captures argv and stdin (-K -), then emits DeepSeek-style SSE + HTTP 200.
     let script = format!(
-        "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"{}\"\nenv > \"{}\"\ncat > \"{}\"\n\
+        "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"{}\"\n[ -z \"${{DEEPSEEK_API_KEY:-}}\" ] || exit 9\ncat > \"{}\"\n\
          printf 'data: {{\"choices\":[{{\"delta\":{{\"reasoning_content\":\"step1 \"}}}}]}}\\n\\n'\n\
          printf 'data: {{\"choices\":[{{\"delta\":{{\"reasoning_content\":\"step2\"}}}}]}}\\n\\n'\n\
          printf 'data: {{\"choices\":[{{\"delta\":{{\"content\":\"Final \"}}}}]}}\\n\\n'\n\
@@ -31,7 +30,6 @@ fn http_adapter_streams_openai_reasoning_and_never_leaks_api_key_in_argv() {
          printf 'data: [DONE]\\n\\n'\n\
          printf '\\n__HTTP_STATUS__:200\\n'\n",
         argv_file.display(),
-        env_file.display(),
         stdin_file.display()
     );
     fs::write(&fake_curl, script).unwrap();
@@ -57,10 +55,8 @@ fn http_adapter_streams_openai_reasoning_and_never_leaks_api_key_in_argv() {
 
     // Security invariant: secret MUST NOT appear in process argv, child env, or status output!
     let argv_dump = fs::read_to_string(&argv_file).unwrap();
-    let env_dump = fs::read_to_string(&env_file).unwrap();
     let stdin_dump = fs::read_to_string(&stdin_file).unwrap();
     assert!(!argv_dump.contains(secret), "API key leaked into curl argv!");
-    assert!(!env_dump.contains(secret), "API key leaked into curl child env!");
     assert!(stdin_dump.contains(secret), "API key must be passed via curl -K stdin");
 
     let status_txt = build_status_report(&dir, false);
@@ -156,4 +152,27 @@ fn custom_http_anthropic_sse_and_http_error_status_and_redaction() {
     std::env::remove_var("EXT_MODELS_HTTP_HARNESSES_FILE");
     std::env::remove_var("CURL_BIN");
     let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn http_stream_reports_truncation_and_reserves_space_for_content() {
+    use ext_models_mcp::harness::{pi::pi_adapter, HarnessAdapter, ParseState};
+    let adapter = pi_adapter();
+    let mut state = ParseState::new();
+    adapter.on_stdout_line_bounded("data: {\"choices\":", true, &mut state);
+    assert!(state.is_error && state.last_message.unwrap().contains("truncated"));
+
+    let mut state = ParseState::new();
+    let line = format!(
+        "data: {}",
+        json!({"choices": [{"delta": {"reasoning_content": "界".repeat(3000)}}]})
+    );
+    for _ in 0..40 {
+        adapter.on_stdout_line(&line, &mut state);
+    }
+    adapter
+        .on_stdout_line(r#"data: {"choices":[{"delta":{"content":"final answer"}}]}"#, &mut state);
+    let message = state.last_message.unwrap();
+    assert!(message.ends_with("\n</reasoning>\n\nfinal answer"));
+    assert!(message.len() <= 128 * 1024 + "final answer".len());
 }

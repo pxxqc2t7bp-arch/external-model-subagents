@@ -41,7 +41,7 @@ pub fn execute_pipeline(
         };
         let res = env.run_target(
             &agent_to_target(&stage.agent),
-            &prompt,
+            &format!("You are {}.\n\n{prompt}", stage.agent.role),
             if i == 0 { handoff_from } else { None },
             None,
             false,

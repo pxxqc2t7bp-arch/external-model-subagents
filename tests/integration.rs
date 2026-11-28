@@ -3,21 +3,32 @@ use ext_models_mcp::harness::catalog::{resolve_route, HarnessInventory};
 use ext_models_mcp::harness::claude::ClaudeAdapter;
 use ext_models_mcp::harness::codex::CodexAdapter;
 use ext_models_mcp::harness::{
-    execute_dispatch, CapabilityMode, HarnessAdapter, ParseState, ProjectRulesMode, RunRequest,
+    execute_dispatch, CapabilityMode, HarnessAdapter, ProjectRulesMode, RunRequest,
     WorkMode,
 };
-use ext_models_mcp::sandbox::{run_supervised, CommandSpec, WorktreeSession};
-use ext_models_mcp::stream::{artifact_dir, read_bounded_line};
+use ext_models_mcp::sandbox::WorktreeSession;
+#[cfg(unix)]
+use ext_models_mcp::harness::ParseState;
+#[cfg(unix)]
+use ext_models_mcp::sandbox::{run_supervised, CommandSpec};
+use ext_models_mcp::stream::{next_call_id, read_bounded_line, TailBuffer};
+#[cfg(unix)]
+use ext_models_mcp::stream::artifact_dir;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{BufReader, Write};
+#[cfg(unix)]
 use std::os::unix::fs::{symlink, PermissionsExt};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
+#[cfg(unix)]
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
+#[cfg(unix)]
 use std::thread;
+#[cfg(unix)]
 use std::time::Duration;
 
 #[test]
@@ -172,7 +183,7 @@ fn provider_isolated_and_version_preserving_routing() {
 #[test]
 fn three_axes_are_strictly_orthogonal() {
     let dummy_req = RunRequest {
-        call_id: "t1".into(),
+        call_id: next_call_id(),
         prompt: "hi".into(),
         effective_prompt: "hi".into(),
         worker_system_patch: Some("PATCH".into()),
@@ -201,9 +212,9 @@ fn three_axes_are_strictly_orthogonal() {
         claude.apply_capabilities(
             &CapabilityMode::Full,
             &HarnessInventory::default(),
-            PathBuf::from("/tmp").as_path(),
+            &dummy_req,
             &mut spec,
-        );
+        ).unwrap();
         assert!(spec
             .envs
             .iter()
@@ -225,9 +236,9 @@ fn three_axes_are_strictly_orthogonal() {
         codex.apply_capabilities(
             &CapabilityMode::Selective(vec!["mcp_keep".into()]),
             &inv,
-            PathBuf::from("/tmp").as_path(),
+            &dummy_req,
             &mut spec,
-        );
+        ).unwrap();
         assert!(spec.args.iter().any(|a| a == "project_doc_max_bytes=0"));
         assert!(
             !spec.args.iter().any(|a| a == "--ignore-rules"),
@@ -238,6 +249,7 @@ fn three_axes_are_strictly_orthogonal() {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn cancellation_reaps_entire_process_group_and_drains_stderr() {
     let tmp = std::env::temp_dir().join(format!("ext-pgid-test-{}", std::process::id()));
@@ -246,7 +258,7 @@ fn cancellation_reaps_entire_process_group_and_drains_stderr() {
     let pid_file = tmp.join("grandchild.pid");
 
     let script = format!(
-        "sleep 60 &\necho $! > \"{}\"\nhead -c 65536 /dev/zero | tr '\\0' 'E' >&2\nsleep 60\n",
+        "(trap '' TERM; exec sleep 10) >/dev/null &\necho $! > \"{}\"\nhead -c 65536 /dev/zero | tr '\\0' 'E' >&2\nsleep 60\n",
         pid_file.display()
     );
     let spec = CommandSpec {
@@ -257,6 +269,7 @@ fn cancellation_reaps_entire_process_group_and_drains_stderr() {
         stdin_data: None,
         cwd: tmp.clone(),
         output_file: None,
+        temp_files: Vec::new(),
     };
 
     let cancel = Arc::new(AtomicBool::new(false));
@@ -276,6 +289,7 @@ fn cancellation_reaps_entire_process_group_and_drains_stderr() {
     .unwrap();
 
     assert!(outcome.cancelled);
+    assert!(outcome.duration_ms < 8_000, "watchdog failed to close inherited stderr");
     assert!(!outcome.stderr_tail.is_empty());
 
     let raw_pid = fs::read_to_string(&pid_file).expect("grandchild pid file must be written");
@@ -292,6 +306,7 @@ fn cancellation_reaps_entire_process_group_and_drains_stderr() {
     let _ = fs::remove_dir_all(&tmp);
 }
 
+#[cfg(unix)]
 #[test]
 fn custom_harness_dirty_worktree_patch_and_zero_copy_handoff() {
     let base = std::env::temp_dir().join(format!("ext-wt-test-{}", std::process::id()));
@@ -313,6 +328,8 @@ fn custom_harness_dirty_worktree_patch_and_zero_copy_handoff() {
         .current_dir(&repo)
         .status()
         .unwrap();
+    assert!(Command::new("git").args(["config", "color.ui", "always"])
+        .current_dir(&repo).status().unwrap().success());
     // Ensure patch export remains `git apply`-compatible even when user sets `diff.noprefix=true`!
     Command::new("git")
         .args(["config", "diff.noprefix", "true"])
@@ -348,7 +365,7 @@ fn custom_harness_dirty_worktree_patch_and_zero_copy_handoff() {
         serde_json::to_string(&json!({
             "harnesses": [{
                 "id": "fake",
-                "binary": "fake-agent",
+                "binary": fake_cli,
                 "strengths": "Test harness",
                 "args": [],
                 "plan_flags": ["--plan"],
@@ -362,22 +379,15 @@ fn custom_harness_dirty_worktree_patch_and_zero_copy_handoff() {
     )
     .unwrap();
 
-    let prev_path = std::env::var("PATH").unwrap_or_default();
-    std::env::set_var("PATH", format!("{}:{prev_path}", bin_dir.display()));
-    std::env::set_var("EXT_MODELS_HARNESSES_FILE", &harnesses_cfg);
-
-    // Run 1: isolated worktree write -> main repo must stay `2`, patch must turn `2 -> 42` cleanly!
-    let (err1, out1) = execute_dispatch(
-        &json!({
-            "harness": "fake",
-            "cwd": repo,
-            "mode": "write",
-            "worktree": true,
-            "prompt": "Update add() to 42"
-        }),
-        Arc::new(AtomicBool::new(false)),
-    );
-    assert!(!err1, "dispatch 1 failed: {out1}");
+    let run = |args: &[&str]| {
+        let output = Command::new(env!("CARGO_BIN_EXE_ext-models-mcp"))
+            .args(["run", "-H", "fake"]).args(args).current_dir(&repo)
+            .env("EXT_MODELS_HARNESSES_FILE", &harnesses_cfg).output().unwrap();
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert!(output.status.success(), "{stdout}");
+        stdout
+    };
+    let out1 = run(&["--mode", "write", "--worktree", "Update add() to 42"]);
     assert!(out1.contains("Refactored lib.rs to return 42"));
     assert!(out1.contains("patch ready:"));
     assert_eq!(
@@ -415,17 +425,7 @@ fn custom_harness_dirty_worktree_patch_and_zero_copy_handoff() {
         .unwrap()
         .to_string();
 
-    let (err2, out2) = execute_dispatch(
-        &json!({
-            "harness": "fake",
-            "cwd": repo,
-            "mode": "plan",
-            "handoff_from": call_id,
-            "prompt": "Review previous change"
-        }),
-        Arc::new(AtomicBool::new(false)),
-    );
-    assert!(!err2, "dispatch 2 failed: {out2}");
+    let out2 = run(&["--mode", "plan", "--handoff", &call_id, "Review previous change"]);
     let len_str = out2
         .split("Received handoff len=")
         .nth(1)
@@ -506,6 +506,7 @@ fn short_timeout_ms_does_not_panic_and_mcp_server_survives() {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn codex_review_avoids_flag_conflict_and_rules_off_preserves_execpolicy() {
     let tmp = std::env::temp_dir().join(format!("ext-codex-rev-{}", std::process::id()));
@@ -630,6 +631,7 @@ fn codex_review_avoids_flag_conflict_and_rules_off_preserves_execpolicy() {
     let _ = fs::remove_dir_all(&tmp);
 }
 
+#[cfg(unix)]
 #[test]
 fn worktree_subdir_canonicalization_commits_binary_unicode_and_export_failure_preserves() {
     let base = std::env::temp_dir().join(format!("ext-wt-p0-{}", std::process::id()));
@@ -653,6 +655,8 @@ fn worktree_subdir_canonicalization_commits_binary_unicode_and_export_failure_pr
         .current_dir(&repo)
         .status()
         .unwrap();
+    assert!(Command::new("git").args(["config", "color.ui", "always"])
+        .current_dir(&repo).status().unwrap().success());
     // Ensure patch export remains `git apply`-compatible even when user sets `diff.noprefix=true`!
     Command::new("git")
         .args(["config", "diff.noprefix", "true"])
@@ -799,7 +803,7 @@ fn worktree_subdir_canonicalization_commits_binary_unicode_and_export_failure_pr
     // Verify patch export failure (e.g. O_NOFOLLOW rejecting a symlink at `<call_id>.patch`)
     // preserves the worktree checkout on disk instead of deleting worker edits!
     let fail_id = format!("wt_preserve_{}", std::process::id());
-    let ws = WorktreeSession::create(&repo, &fail_id).unwrap();
+    let ws = WorktreeSession::create(&repo, &fail_id, &AtomicBool::new(false)).unwrap();
     fs::write(ws.worktree_cwd.join("precious.txt"), "DO_NOT_LOSE_ME\n").unwrap();
     let poison_patch = artifact_dir().unwrap().join(format!("{fail_id}.patch"));
     let _ = fs::remove_file(&poison_patch);
@@ -914,6 +918,7 @@ fn worktree_subdir_canonicalization_commits_binary_unicode_and_export_failure_pr
     let _ = fs::remove_dir_all(&base);
 }
 
+#[cfg(unix)]
 #[test]
 fn claude_large_75kb_single_line_json_and_truncation_guard() {
     let tmp = std::env::temp_dir().join(format!("ext-claude-75k-{}", std::process::id()));
@@ -984,4 +989,137 @@ fn claude_large_75kb_single_line_json_and_truncation_guard() {
     );
 
     let _ = fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn oversized_line_keeps_previous_diagnostics() {
+    let mut tail = TailBuffer::new(257);
+    tail.push_line("first diagnostic");
+    tail.push_line(&"界".repeat(200));
+    assert_eq!(tail.as_str(), format!("first diagnostic\n{}", "界".repeat(42)));
+}
+
+#[test]
+fn worktree_requires_initial_commit() {
+    let repo = std::env::temp_dir().join(next_call_id());
+    assert!(Command::new("git").args(["init", "-q"]).arg(&repo).status().unwrap().success());
+    let error =
+        WorktreeSession::create(&repo, &next_call_id(), &AtomicBool::new(false)).err().unwrap();
+    fs::remove_dir_all(repo).unwrap();
+    assert!(error.contains("HEAD is unborn") && error.contains("initial commit"), "{error}");
+}
+
+#[test]
+fn slash_model_ids_take_precedence_over_provider_shorthand() {
+    let mut inv = HarnessInventory::default();
+    inv.providers.insert("deepseek".into(), vec!["deepseek-r1".into()]);
+    inv.providers
+        .insert("gateway".into(), vec!["openai/gpt-5.4".into(), "deepseek/deepseek-r1".into()]);
+    let inventories = [("codex".into(), inv)].into();
+    let available = ["codex".into()].into();
+    for harness in [None, Some("codex")] {
+        for model in ["openai/gpt-5.4", "deepseek/deepseek-r1"] {
+            let route =
+                resolve_route(harness, None, Some(model), false, &inventories, &available).unwrap();
+            assert_eq!(route.model.as_deref(), Some(model));
+            assert_eq!(route.provider.as_deref(), Some("gateway"));
+        }
+    }
+}
+
+#[test]
+fn dispatch_rejects_invalid_policy_and_target_fields() {
+    for (field, value, message) in [
+        ("worktree", json!("true"), "boolean"),
+        ("swarm", json!([]), "object"),
+        ("targets", json!(["codex"]), "objects"),
+        ("targets", json!([{}, {}]), "single-target"),
+    ] {
+        let mut args = json!({"prompt": "test", "session_id": "last"});
+        args[field] = value;
+        let (failed, out) = execute_dispatch(&args, Arc::new(AtomicBool::new(false)));
+        assert!(failed && out.contains("[invalid_input]") && out.contains(message), "{out}");
+    }
+}
+
+#[test]
+fn binary_search_returns_absolute_paths_and_prefers_override() {
+    use ext_models_mcp::harness::discovery::find_binary_in;
+    let executable = std::env::current_exe().unwrap();
+    let dir = executable.parent().unwrap().to_owned();
+    let name = executable.file_name().unwrap().to_str().unwrap();
+    assert_eq!(find_binary_in(name, None, &[dir]), Some(executable.clone()));
+    assert_eq!(find_binary_in("missing", Some(&executable), &[]), Some(executable));
+    let relative = PathBuf::from("scripts/install.sh");
+    let found = find_binary_in("missing", Some(&relative), &[]);
+    assert_eq!(found, Some(std::env::current_dir().unwrap().join(relative)));
+    assert_eq!(find_binary_in("missing", None, &[]), None);
+}
+
+#[test]
+fn cli_help_and_invalid_flags() {
+    let bin = env!("CARGO_BIN_EXE_ext-models-mcp");
+    let help = Command::new(bin).arg("--help").output().unwrap();
+    assert!(help.status.success());
+    let text = String::from_utf8(help.stdout).unwrap();
+    for flag in ["--effort", "--file", "--timeout-ms", "--max-chars"] {
+        assert!(text.contains(flag));
+    }
+    for args in [&["--timeout-ms", "bad"][..], &["--max-chars", "bad"], &["--file"], &["--unknown"]]
+    {
+        let result = Command::new(bin).arg("run").args(args).output().unwrap();
+        assert_eq!(result.status.code(), Some(2));
+        assert!(String::from_utf8(result.stderr).unwrap().contains(args[0]));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn claude_project_mcp_credentials_use_a_temporary_private_file() {
+    let dir = std::env::temp_dir().join(next_call_id());
+    fs::create_dir_all(dir.join(".claude")).unwrap();
+    let settings = json!({"mcpServers":{"project-mcp":{"headers":{"key":"fixture-secret"}}}});
+    fs::write(dir.join(".claude/settings.json"), settings.to_string()).unwrap();
+    let fake = dir.join("fake-claude");
+    fs::write(
+        &fake,
+        r#"#!/bin/sh
+set -eu
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        *fixture-secret*) exit 9 ;;
+        --mcp-config) shift; cfg=$1 ;;
+    esac
+    shift
+done
+[ -n "$(find "$cfg" -type f -perm 600 -print)" ]
+grep -q fixture-secret "$cfg"
+printf '%s' "$cfg" > config-path
+cat >/dev/null
+echo '{"result":"ok"}'
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&fake, fs::Permissions::from_mode(0o700)).unwrap();
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_ext-models-mcp"))
+            .args(args)
+            .current_dir(&dir)
+            .env("HOME", &dir)
+            .env("CLAUDE_CONFIG_DIR", dir.join("config"))
+            .env("CLAUDE_BIN", &fake)
+            .output()
+            .unwrap()
+    };
+    let status = run(&["status"]);
+    let report: Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert!(report["harnesses"].as_array().unwrap().iter().any(|h| h["harness"] == "claude"
+        && h["mcps"].as_array().unwrap().contains(&json!("project-mcp"))));
+    for args in [["--mcp", "project-mcp"], ["--caps", "full"]] {
+        let result = run(&["run", "-H", "claude", args[0], args[1], "test"]);
+        assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stdout));
+        let path = fs::read_to_string(dir.join("config-path")).unwrap();
+        assert!(!PathBuf::from(path).exists());
+    }
+    fs::remove_dir_all(dir).unwrap();
 }

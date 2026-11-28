@@ -7,7 +7,6 @@ use crate::harness::{
 };
 use crate::sandbox::CommandSpec;
 use serde_json::Value;
-use std::path::Path;
 
 pub struct TraeAdapter;
 
@@ -73,6 +72,7 @@ impl HarnessAdapter for TraeAdapter {
                 full_prompt.push_str("\n\n");
             }
         } else if req.project_rules == ProjectRulesMode::Off {
+            // traecli has no native rule-disable flag; Off is best-effort prompt guidance.
             full_prompt.push_str(
                 "Instruction Override: Disregard repository-level AGENTS.md / workflow rules for this isolated run.\n\n",
             );
@@ -92,6 +92,7 @@ impl HarnessAdapter for TraeAdapter {
             stdin_data: None,
             cwd: req.cwd.clone(),
             output_file: None,
+            temp_files: Vec::new(),
         })
     }
 
@@ -99,9 +100,9 @@ impl HarnessAdapter for TraeAdapter {
         &self,
         caps: &CapabilityMode,
         _inv: &HarnessInventory,
-        _cwd: &Path,
+        _req: &RunRequest,
         spec: &mut CommandSpec,
-    ) {
+    ) -> Result<(), String> {
         let wait_secs = match caps {
             CapabilityMode::Code => "0",
             CapabilityMode::Selective(_) | CapabilityMode::Full => "8",
@@ -113,6 +114,7 @@ impl HarnessAdapter for TraeAdapter {
             .unwrap_or(spec.args.len());
         spec.args.insert(pos, "--mcp-init-wait-seconds".into());
         spec.args.insert(pos + 1, wait_secs.into());
+        Ok(())
     }
 
     fn on_stdout_line(&self, line: &str, state: &mut ParseState) {

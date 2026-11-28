@@ -14,7 +14,7 @@ pub mod trae;
 pub mod zcode;
 
 use crate::alloc_cap::heap_stats_kb;
-use crate::error::record_worker_panic;
+use crate::error::{record_worker_panic, ErrorKind, RichError};
 use crate::harness::catalog::{
     canonical_harness_id, resolve_route_rich, scan_registered_inventories, HarnessInventory,
 };
@@ -182,15 +182,19 @@ pub trait HarnessAdapter: Send + Sync {
         &self,
         _caps: &CapabilityMode,
         _inv: &HarnessInventory,
-        _cwd: &Path,
+        _req: &RunRequest,
         _spec: &mut CommandSpec,
-    ) {
+    ) -> Result<(), String> {
+        Ok(())
     }
 
     /// Maximum bytes retained per single stdout line for this harness.
     fn max_stdout_line_bytes(&self) -> usize {
         crate::stream::MAX_LINE_BYTES
     }
+
+    /// Select a different parser when the request uses a fallback transport.
+    fn output_parser(&self, _spec: &CommandSpec) -> Option<&dyn HarnessAdapter> { None }
 
     /// Consume a single bounded stdout line in `O(1)` memory.
     fn on_stdout_line(&self, line: &str, state: &mut ParseState);
@@ -270,6 +274,7 @@ fn local_cli_command(bin: &Path, mut args: Vec<String>, req: &RunRequest) -> Com
         stdin_data: Some(stdin_data),
         cwd: req.cwd.clone(),
         output_file: None,
+        temp_files: Vec::new(),
     }
 }
 
@@ -286,7 +291,7 @@ fn build_prompts(
 ) -> Result<(String, Option<String>), String> {
     let mut sections = Vec::new();
 
-    if let Some(hid) = handoff_from.filter(|s| !s.trim().is_empty()) {
+    if let Some(hid) = handoff_from {
         let prev = read_handoff(hid, 48 * 1024)?;
         sections.push(format!("<previous_agent_handoff id=\"{hid}\">\n{prev}\n</previous_agent_handoff>"));
     }
@@ -437,6 +442,21 @@ fn dispatch_inner(
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(String::from);
+    let invalid = |message| (true, RichError::new(ErrorKind::InvalidInput, message).to_string());
+    if !args["worktree"].is_null() && !args["worktree"].is_boolean() {
+        return invalid("worktree must be a boolean");
+    }
+    if !args["swarm"].is_null() && !args["swarm"].is_object() {
+        return invalid("swarm must be an object");
+    }
+    if let Some(targets) = args["targets"].as_array() {
+        if targets.iter().any(|target| !target.is_object()) {
+            return invalid("targets elements must be objects");
+        }
+        if targets.len() > 1 && session_req.is_some() {
+            return invalid("session_id is single-target only");
+        }
+    }
     let keep_session = args
         .get("keep_session")
         .and_then(Value::as_bool)
@@ -682,8 +702,9 @@ impl DispatchEnv {
             }
         }
 
+        let deadline = Instant::now() + Duration::from_millis(self.timeout_ms);
         let wt_session = if self.worktree {
-            match WorktreeSession::create(&self.cwd, &call_id) {
+            match WorktreeSession::create(&self.cwd, &call_id, &self.cancel) {
                 Ok(ws) => Some(ws),
                 Err(e) => {
                     let msg = format!("Failed to create isolated git worktree: {e}");
@@ -779,21 +800,33 @@ impl DispatchEnv {
         adapter.apply_project_rules(self.project_rules, &req, &mut spec);
         let empty_inv = HarnessInventory::default();
         let inv = self.inventories.get(&route.harness).unwrap_or(&empty_inv);
-        adapter.apply_capabilities(&self.capabilities, inv, &exec_cwd, &mut spec);
+        if let Err(e) = adapter.apply_capabilities(&self.capabilities, inv, &req, &mut spec) {
+            return TargetRunResult { call_id, failed: true, raw_body: e.clone(), formatted: e };
+        }
+        if self.worktree {
+            spec.env_remove.extend(["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE"].map(String::from));
+        }
 
+        let parser = adapter.output_parser(&spec).unwrap_or(adapter.as_ref());
         let mut state = ParseState::new();
         let mut outcome = match run_supervised_bounded(
             &spec,
-            Duration::from_millis(self.timeout_ms),
+            deadline,
             Duration::from_millis(self.idle_timeout_ms),
-            adapter.max_stdout_line_bytes(),
+            parser.max_stdout_line_bytes(),
             Arc::clone(&self.cancel),
-            |line, trunc| adapter.on_stdout_line_bounded(line, trunc, &mut state),
+            |line, trunc| parser.on_stdout_line_bounded(line, trunc, &mut state),
         ) {
             Ok(o) => o,
-            Err(e) => {
+            Err(mut e) => {
                 if let Some(ws) = wt_session {
-                    ws.abort();
+                    let summary = ws.finalize();
+                    if let Some(path) = summary.patch_path {
+                        e.push_str(&format!("\n[patch ready: `git apply {}`]", path.display()));
+                    }
+                    if let (Some(err), Some(path)) = (summary.export_error, summary.preserved_worktree) {
+                        e.push_str(&format!("\n[worktree export error: {err}; checkout preserved at {}]", path.display()));
+                    }
                 }
                 return TargetRunResult {
                     call_id,
@@ -809,7 +842,8 @@ impl DispatchEnv {
             .output_file
             .as_ref()
             .and_then(|p| {
-                let txt = read_file_capped(p, 2 * 1024 * 1024).ok();
+                let cap = (crate::alloc_cap::hard_limit_bytes() / 8).clamp(256 * 1024, 2 * 1024 * 1024);
+                let txt = read_file_capped(p, cap).ok();
                 let _ = fs::remove_file(p);
                 txt
             })

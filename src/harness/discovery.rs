@@ -30,25 +30,28 @@ pub fn home_dir() -> PathBuf {
 }
 
 pub fn find_binary(name: &str, env_override: Option<&str>) -> Option<PathBuf> {
-    if let Some(key) = env_override {
-        if let Some(val) = env::var_os(key) {
-            let p = PathBuf::from(val);
-            if is_executable(&p) {
-                return Some(p);
-            }
-        }
+    let override_bin = env_override.and_then(env::var_os).map(PathBuf::from);
+    find_binary_in(name, override_bin.as_deref(), &candidate_bin_dirs())
+}
+
+pub fn find_binary_in(name: &str, override_bin: Option<&Path>, dirs: &[PathBuf]) -> Option<PathBuf> {
+    if let Some(path) = override_bin.filter(|p| is_executable(p)) {
+        return std::path::absolute(path).ok();
     }
-    for dir in candidate_bin_dirs() {
+    if Path::new(name).components().count() > 1 && is_executable(Path::new(name)) {
+        return std::path::absolute(name).ok();
+    }
+    for dir in dirs {
         let candidate = dir.join(name);
         if is_executable(&candidate) {
-            return Some(candidate);
+            return std::path::absolute(candidate).ok();
         }
         #[cfg(windows)]
         if Path::new(name).extension().is_none() {
             for ext in ["exe", "cmd", "bat"] {
                 let with_ext = dir.join(format!("{name}.{ext}"));
                 if is_executable(&with_ext) {
-                    return Some(with_ext);
+                    return std::path::absolute(with_ext).ok();
                 }
             }
         }

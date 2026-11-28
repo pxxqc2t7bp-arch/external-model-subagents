@@ -52,19 +52,26 @@ impl HarnessAdapter for KimiAdapter {
             .find(|name| env::var_os(name).is_some_and(|v| !v.is_empty()))
     }
     fn build_base(&self, req: &RunRequest) -> Result<CommandSpec, String> {
-        match &self.bin {
-            Some(bin) => {
-                let mut args = vec!["--quiet".into()];
-                if req.mode == WorkMode::Full {
-                    args.push("--yolo".into());
-                }
-                Ok(local_cli_command(bin, args, req))
-            }
-            None => self.http.build_request(
-                req,
-                self.response_key_env().unwrap_or(&self.http.api_key_env),
-            ),
+        let key_env = self.response_key_env();
+        let plan_http = req.mode == WorkMode::Plan
+            && key_env.is_some()
+            && find_binary("curl", Some("CURL_BIN")).is_some();
+        if self.bin.is_none() || plan_http {
+            let mut spec = self.http.build_request(req, key_env.unwrap_or(&self.http.api_key_env))?;
+            spec.env_remove = vec!["KIMI_API_KEY".into(), "MOONSHOT_API_KEY".into()];
+            return Ok(spec);
         }
+        if req.mode == WorkMode::Plan && !req.worktree {
+            return Err("Kimi plan mode requires an API key and curl, or worktree=true because kimi --quiet auto-approves writes".into());
+        }
+        let mut args = vec!["--quiet".into()];
+        if req.mode == WorkMode::Full {
+            args.push("--yolo".into());
+        }
+        Ok(local_cli_command(self.bin.as_ref().unwrap(), args, req))
+    }
+    fn output_parser(&self, spec: &CommandSpec) -> Option<&dyn HarnessAdapter> {
+        (spec.args.first().is_some_and(|arg| arg == "-q")).then_some(&self.http)
     }
     fn on_stdout_line(&self, line: &str, state: &mut ParseState) {
         if self.bin.is_some() {

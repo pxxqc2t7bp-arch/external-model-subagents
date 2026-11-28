@@ -7,7 +7,7 @@ use crate::stream::{
 use std::fs;
 use std::io::{BufReader, Read, Write};
 use std::path::{Component, Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread;
@@ -55,6 +55,11 @@ mod sys {
         }
     }
 
+    pub fn kill_group(pid: u32) {
+        // The child is the process group leader established by configure_group.
+        unsafe { libc::kill(-(pid as i32), libc::SIGKILL); }
+    }
+
     pub fn reap_group(pid: u32) {
         if let Ok(pgid) = i32::try_from(pid) {
             if pgid > 0 {
@@ -90,6 +95,10 @@ mod sys {
             .status();
     }
 
+    pub fn kill_group(pid: u32) {
+        terminate_process_group(pid, &AtomicBool::new(false));
+    }
+
     pub fn reap_group(_pid: u32) {}
 
     pub fn bytes_to_path_buf(bytes: &[u8]) -> PathBuf {
@@ -113,14 +122,33 @@ fn job_limiter() -> &'static (Mutex<usize>, Condvar, usize) {
     })
 }
 
-pub fn acquire_job_permit() -> JobPermit {
+fn check_pending(cancel: &AtomicBool, deadline: Option<Instant>) -> Result<(), String> {
+    if cancel.load(Ordering::Acquire) {
+        return Err("[status=cancelled] request cancelled before spawn".into());
+    }
+    if deadline.is_some_and(|end| Instant::now() >= end) {
+        return Err("[status=timeout] request timed out before spawn".into());
+    }
+    Ok(())
+}
+
+pub fn acquire_job_permit(
+    cancel: &AtomicBool,
+    deadline: Option<Instant>,
+) -> Result<JobPermit, String> {
     let (lock, cvar, max_jobs) = job_limiter();
     let mut active = lock.lock().unwrap_or_else(|e| e.into_inner());
-    while *active >= *max_jobs {
-        active = cvar.wait(active).unwrap_or_else(|e| e.into_inner());
+    loop {
+        check_pending(cancel, deadline)?;
+        if *active < *max_jobs {
+            *active += 1;
+            return Ok(JobPermit);
+        }
+        let poll = Duration::from_millis(80);
+        let wait =
+            deadline.map_or(poll, |end| poll.min(end.saturating_duration_since(Instant::now())));
+        (active, _) = cvar.wait_timeout(active, wait).unwrap_or_else(|e| e.into_inner());
     }
-    *active += 1;
-    JobPermit
 }
 
 impl Drop for JobPermit {
@@ -132,7 +160,7 @@ impl Drop for JobPermit {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct CommandSpec {
     pub program: PathBuf,
     pub args: Vec<String>,
@@ -141,6 +169,33 @@ pub struct CommandSpec {
     pub stdin_data: Option<String>,
     pub cwd: PathBuf,
     pub output_file: Option<PathBuf>,
+    pub temp_files: Vec<PathBuf>,
+}
+
+impl Drop for CommandSpec {
+    fn drop(&mut self) {
+        for path in &self.temp_files {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
+struct ChildGuard {
+    child: Child,
+    finished: Arc<AtomicBool>,
+    watchdog: Option<thread::JoinHandle<()>>,
+}
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        if !self.finished.swap(true, Ordering::AcqRel) {
+            sys::kill_group(self.child.id());
+            let _ = self.child.wait();
+        }
+        if let Some(handle) = self.watchdog.take() {
+            let _ = handle.join();
+        }
+    }
 }
 
 pub struct ExecOutcome {
@@ -167,7 +222,7 @@ where
 {
     run_supervised_bounded(
         spec,
-        total_timeout,
+        Instant::now() + total_timeout,
         idle_timeout,
         MAX_LINE_BYTES,
         cancel,
@@ -178,7 +233,7 @@ where
 /// Like [`run_supervised`], with a configurable per-line stdout byte cap.
 pub fn run_supervised_bounded<F>(
     spec: &CommandSpec,
-    total_timeout: Duration,
+    deadline: Instant,
     idle_timeout: Duration,
     max_stdout_line_bytes: usize,
     cancel: Arc<AtomicBool>,
@@ -187,7 +242,7 @@ pub fn run_supervised_bounded<F>(
 where
     F: FnMut(&str, bool),
 {
-    let _permit = acquire_job_permit();
+    let _permit = acquire_job_permit(&cancel, Some(deadline))?;
     let start = Instant::now();
 
     let mut cmd = Command::new(&spec.program);
@@ -212,23 +267,32 @@ where
         cmd.env(k, v);
     }
 
-    let mut child = cmd
+    check_pending(&cancel, Some(deadline))?;
+    let child = cmd
         .spawn()
         .map_err(|e| format!("failed to spawn {}: {e}", spec.program.display()))?;
+    let mut guard = ChildGuard {
+        child,
+        finished: Arc::new(AtomicBool::new(false)),
+        watchdog: None,
+    };
+    let child = &mut guard.child;
     let pid = child.id();
 
     if let (Some(mut sin), Some(payload)) = (child.stdin.take(), spec.stdin_data.clone()) {
-        let _ = thread::Builder::new()
+        thread::Builder::new()
             .name("ext-stdin".into())
             .stack_size(SMALL_STACK)
             .spawn(move || {
-                let _ = sin.write_all(payload.as_bytes());
-                let _ = sin.flush();
+                if let Err(e) = sin.write_all(payload.as_bytes()) {
+                    if e.kind() != std::io::ErrorKind::BrokenPipe {
+                        eprintln!("child stdin write failed: {e}");
+                    }
+                }
                 // Dropping `sin` immediately closes pipe EOF so CLI starts working.
-            });
+            }).map_err(|e| format!("stdin thread error: {e}"))?;
     }
 
-    let finished = Arc::new(AtomicBool::new(false));
     let timed_out = Arc::new(AtomicBool::new(false));
     let idle_timed_out = Arc::new(AtomicBool::new(false));
     let was_cancelled = Arc::new(AtomicBool::new(false));
@@ -244,25 +308,24 @@ where
             let mut reader = BufReader::with_capacity(4096, stderr_pipe);
             let mut scratch = Vec::with_capacity(1024);
             let mut tail = TailBuffer::new(STDERR_CAP);
-            while let Ok(Some((line, _))) = read_bounded_line(&mut reader, &mut scratch, 8192) {
+            while let Some((line, _)) = read_bounded_line(&mut reader, &mut scratch, 8192)? {
                 act_err.store(start.elapsed().as_millis() as u64, Ordering::Relaxed);
                 tail.push_line(&line);
             }
-            tail.as_str().to_string()
+            Ok::<_, std::io::Error>(tail.as_str().to_string())
         })
         .map_err(|e| format!("stderr thread error: {e}"))?;
 
     // Watchdog thread enforcing cancel, total_timeout, and idle_timeout.
-    let fin_wd = Arc::clone(&finished);
+    let fin_wd = Arc::clone(&guard.finished);
     let to_wd = Arc::clone(&timed_out);
     let idle_wd = Arc::clone(&idle_timed_out);
     let can_wd = Arc::clone(&was_cancelled);
     let act_wd = Arc::clone(&last_activity_ms);
-    let watchdog = thread::Builder::new()
+    guard.watchdog = Some(thread::Builder::new()
         .name("ext-watchdog".into())
         .stack_size(SMALL_STACK)
         .spawn(move || {
-            let total_ms = total_timeout.as_millis() as u64;
             let idle_ms = idle_timeout.as_millis() as u64;
             while !fin_wd.load(Ordering::Acquire) {
                 thread::sleep(Duration::from_millis(80));
@@ -276,7 +339,7 @@ where
                     sys::terminate_process_group(pid, &fin_wd);
                     break;
                 }
-                if elapsed >= total_ms {
+                if Instant::now() >= deadline {
                     to_wd.store(true, Ordering::Release);
                     sys::terminate_process_group(pid, &fin_wd);
                     break;
@@ -288,27 +351,28 @@ where
                 }
             }
         })
-        .map_err(|e| format!("watchdog thread error: {e}"))?;
+        .map_err(|e| format!("watchdog thread error: {e}"))?);
 
     // Read stdout line-by-line on the current worker thread with bounded scratch.
     let line_cap = max_stdout_line_bytes.max(1024);
     let stdout_pipe = child.stdout.take().ok_or("missing child stdout")?;
     let mut stdout_reader = BufReader::with_capacity(8192, stdout_pipe);
     let mut scratch = Vec::with_capacity(4096);
-    while let Ok(Some((line, trunc))) =
-        read_bounded_line(&mut stdout_reader, &mut scratch, line_cap)
+    while let Some((line, trunc)) = read_bounded_line(&mut stdout_reader, &mut scratch, line_cap)
+        .map_err(|e| format!("stdout read error: {e}"))?
     {
         last_activity_ms.store(start.elapsed().as_millis() as u64, Ordering::Relaxed);
         on_line(&line, trunc);
     }
 
     let status = child.wait().map_err(|e| format!("wait error: {e}"))?;
-    finished.store(true, Ordering::Release);
-    // Ensure any stray background grandchildren in the process group are reaped.
     sys::reap_group(pid);
-
-    let _ = watchdog.join();
-    let stderr_tail = stderr_handle.join().unwrap_or_default();
+    let stderr_tail = stderr_handle.join().map_err(|_| "stderr thread panicked")?
+        .map_err(|e| format!("stderr read error: {e}"))?;
+    guard.finished.store(true, Ordering::Release);
+    if let Some(watchdog) = guard.watchdog.take() {
+        watchdog.join().map_err(|_| "watchdog thread panicked")?;
+    }
 
     Ok(ExecOutcome {
         exit_code: status.code().unwrap_or(-1),
@@ -340,7 +404,7 @@ pub struct WorktreeSummary {
 }
 
 impl WorktreeSession {
-    pub fn create(cwd: &Path, call_id: &str) -> Result<Self, String> {
+    pub fn create(cwd: &Path, call_id: &str, cancel: &AtomicBool) -> Result<Self, String> {
         let canon_cwd = fs::canonicalize(cwd)
             .map_err(|e| format!("failed to canonicalize cwd {}: {e}", cwd.display()))?;
         let mut root_bytes = run_git_bytes(&canon_cwd, &["rev-parse", "--show-toplevel"])?;
@@ -388,130 +452,121 @@ impl WorktreeSession {
             ));
         }
         let wt_str = raw_wt_root.to_string_lossy().into_owned();
+        check_pending(cancel, None)?;
         run_git(&repo_root, &["worktree", "add", "--detach", &wt_str, &base_ref])?;
         let wt_root = fs::canonicalize(&raw_wt_root).unwrap_or(raw_wt_root);
 
-        let setup_res = (|| -> Result<(String, PathBuf, usize), String> {
-            // Copy up to 50 untracked non-ignored regular files (<= 2 MiB each) using bounded
-            // NUL-delimited raw paths (`-z`) so huge untracked trees never spike heap memory.
-            let (mut untracked_raw, extra_nuls, untracked_capped) = run_git_bytes_capped(
-                &repo_root,
-                &["ls-files", "-z", "--others", "--exclude-standard"],
-                128 * 1024,
-            )?;
-            let mut skipped_untracked = if untracked_capped {
-                if let Some(last_nul) = untracked_raw.iter().rposition(|&b| b == 0) {
-                    let tail_has_partial = last_nul + 1 < untracked_raw.len();
-                    untracked_raw.truncate(last_nul + 1);
-                    extra_nuls.max(usize::from(tail_has_partial))
-                } else {
-                    untracked_raw.clear();
-                    extra_nuls.max(1)
-                }
+        let mut session = Self {
+            repo_root, wt_root, worktree_cwd: PathBuf::new(), baseline_tree: String::new(),
+            call_id: call_id.to_string(), skipped_untracked: 0, cleaned: false,
+        };
+        // Copy up to 50 untracked non-ignored regular files (<= 2 MiB each) using bounded
+        // NUL-delimited raw paths (`-z`) so huge untracked trees never spike heap memory.
+        let (mut untracked_raw, extra_nuls, untracked_capped) = run_git_bytes_capped(
+            &session.repo_root,
+            &["ls-files", "-z", "--others", "--exclude-standard"],
+            128 * 1024,
+        )?;
+        let mut skipped_untracked = if untracked_capped {
+            if let Some(last_nul) = untracked_raw.iter().rposition(|&b| b == 0) {
+                let tail_has_partial = last_nul + 1 < untracked_raw.len();
+                untracked_raw.truncate(last_nul + 1);
+                extra_nuls.max(usize::from(tail_has_partial))
             } else {
-                0
+                untracked_raw.clear();
+                extra_nuls.max(1)
+            }
+        } else {
+            0
+        };
+        let mut copied_count = 0usize;
+        for entry in untracked_raw.split(|&b| b == 0).filter(|s| !s.is_empty()) {
+            check_pending(cancel, None)?;
+            let rel_buf = sys::bytes_to_path_buf(entry);
+            let rel = rel_buf.as_path();
+            if rel.components().any(|c| !matches!(c, Component::Normal(_))) {
+                skipped_untracked += 1;
+                continue;
+            }
+            if copied_count >= 50 {
+                skipped_untracked += 1;
+                continue;
+            }
+            let src = session.repo_root.join(rel);
+            let Ok(meta) = fs::symlink_metadata(&src) else {
+                skipped_untracked += 1;
+                continue;
             };
-            let mut copied_count = 0usize;
-            for entry in untracked_raw.split(|&b| b == 0).filter(|s| !s.is_empty()) {
-                let rel_buf = sys::bytes_to_path_buf(entry);
-                let rel = rel_buf.as_path();
-                if rel.components().any(|c| !matches!(c, Component::Normal(_))) {
-                    skipped_untracked += 1;
-                    continue;
-                }
-                if copied_count >= 50 {
-                    skipped_untracked += 1;
-                    continue;
-                }
-                let src = repo_root.join(rel);
-                let Ok(meta) = fs::symlink_metadata(&src) else {
-                    skipped_untracked += 1;
-                    continue;
-                };
-                if meta.file_type().is_symlink()
-                    || !meta.file_type().is_file()
-                    || meta.len() > 2 * 1024 * 1024
-                {
-                    skipped_untracked += 1;
-                    continue;
-                }
-                let dst = wt_root.join(rel);
-                if let Some(parent) = dst.parent() {
-                    fs::create_dir_all(parent).map_err(|e| {
-                        format!("failed to create dir {}: {e}", parent.display())
-                    })?;
-                }
-                fs::copy(&src, &dst)
-                    .map_err(|e| format!("failed to copy untracked {}: {e}", rel.display()))?;
-                copied_count += 1;
+            if meta.file_type().is_symlink()
+                || !meta.file_type().is_file()
+                || meta.len() > 2 * 1024 * 1024
+            {
+                skipped_untracked += 1;
+                continue;
             }
-
-            // Snapshot pre-existing untracked files on detached HEAD so final patch contains ONLY worker edits.
-            if copied_count > 0 {
-                run_git(&wt_root, &["add", "-A"])?;
-                run_git(
-                    &wt_root,
-                    &[
-                        "-c",
-                        "user.name=ext-models",
-                        "-c",
-                        "user.email=ext@localhost",
-                        "commit",
-                        "-q",
-                        "--no-verify",
-                        "--no-gpg-sign",
-                        "-m",
-                        "ext-models-baseline",
-                    ],
-                )?;
-            }
-
-            // Capture immutable baseline tree OID so even worker `git commit`s are included in final patch.
-            let baseline_tree = run_git(&wt_root, &["write-tree"])?.trim().to_string();
-            if baseline_tree.is_empty() {
-                return Err("failed to record worktree baseline tree OID".into());
-            }
-
-            let candidate_cwd = wt_root.join(&rel_sub);
-            if !candidate_cwd.exists() {
-                fs::create_dir_all(&candidate_cwd).map_err(|e| {
-                    format!(
-                        "failed to create worktree subdirectory {}: {e}",
-                        candidate_cwd.display()
-                    )
+            let dst = session.wt_root.join(rel);
+            if let Some(parent) = dst.parent() {
+                fs::create_dir_all(parent).map_err(|e| {
+                    format!("failed to create dir {}: {e}", parent.display())
                 })?;
             }
-            let worktree_cwd = fs::canonicalize(&candidate_cwd).map_err(|e| {
+            fs::copy(&src, &dst)
+                .map_err(|e| format!("failed to copy untracked {}: {e}", rel.display()))?;
+            copied_count += 1;
+        }
+
+        // Snapshot pre-existing untracked files on detached HEAD so final patch contains ONLY worker edits.
+        if copied_count > 0 {
+            run_git(&session.wt_root, &["add", "-A"])?;
+            run_git(
+                &session.wt_root,
+                &[
+                    "-c",
+                    "user.name=ext-models",
+                    "-c",
+                    "user.email=ext@localhost",
+                    "commit",
+                    "-q",
+                    "--no-verify",
+                    "--no-gpg-sign",
+                    "-m",
+                    "ext-models-baseline",
+                ],
+            )?;
+        }
+
+        // Capture immutable baseline tree OID so even worker `git commit`s are included in final patch.
+        let baseline_tree = run_git(&session.wt_root, &["write-tree"])?.trim().to_string();
+        if baseline_tree.is_empty() {
+            return Err("failed to record worktree baseline tree OID".into());
+        }
+
+        let candidate_cwd = session.wt_root.join(&rel_sub);
+        if !candidate_cwd.exists() {
+            fs::create_dir_all(&candidate_cwd).map_err(|e| {
                 format!(
-                    "failed to canonicalize worktree cwd {}: {e}",
+                    "failed to create worktree subdirectory {}: {e}",
                     candidate_cwd.display()
                 )
             })?;
-            if !worktree_cwd.starts_with(&wt_root) {
-                return Err(format!(
-                    "worktree cwd {} escaped worktree root {}",
-                    worktree_cwd.display(),
-                    wt_root.display()
-                ));
-            }
-            Ok((baseline_tree, worktree_cwd, skipped_untracked))
-        })();
-
-        match setup_res {
-            Ok((baseline_tree, worktree_cwd, skipped_untracked)) => Ok(Self {
-                repo_root,
-                worktree_cwd,
-                wt_root,
-                baseline_tree,
-                call_id: call_id.to_string(),
-                skipped_untracked,
-                cleaned: false,
-            }),
-            Err(e) => {
-                cleanup_worktree(&repo_root, &wt_root);
-                Err(e)
-            }
         }
+        let worktree_cwd = fs::canonicalize(&candidate_cwd).map_err(|e| {
+            format!(
+                "failed to canonicalize worktree cwd {}: {e}",
+                candidate_cwd.display()
+            )
+        })?;
+        if !worktree_cwd.starts_with(&session.wt_root) {
+            return Err(format!(
+                "worktree cwd {} escaped worktree root {}",
+                worktree_cwd.display(),
+                session.wt_root.display()
+            ));
+        }
+        session.baseline_tree = baseline_tree;
+        session.worktree_cwd = worktree_cwd;
+        session.skipped_untracked = skipped_untracked;
+        Ok(session)
     }
 
     /// Tear down an unused worktree when request preparation fails before spawning the worker.
@@ -528,7 +583,7 @@ impl WorktreeSession {
             let stat = run_git_capped(
                 &self.wt_root,
                 &[
-                    "diff",
+                    "diff", "--no-color",
                     "--cached",
                     "--stat",
                     "--no-ext-diff",
@@ -579,7 +634,8 @@ impl Drop for WorktreeSession {
 }
 
 fn snapshot_tracked_without_touching_index(repo_root: &Path, call_id: &str) -> Result<String, String> {
-    let head_oid = run_git(repo_root, &["rev-parse", "--verify", "HEAD"])?
+    let head_oid = run_git(repo_root, &["rev-parse", "--verify", "HEAD"])
+        .map_err(|e| format!("repository has no commits yet (HEAD is unborn); create an initial commit before using worktree=true: {e}"))?
         .trim()
         .to_string();
     let head_tree = run_git(repo_root, &["rev-parse", "--verify", "HEAD^{tree}"])?
@@ -668,7 +724,7 @@ fn cleanup_worktree(repo_root: &Path, wt_root: &Path) {
 }
 
 pub fn git_diff_stat(cwd: &Path) -> Option<String> {
-    let out = run_git(cwd, &["status", "--short"]).ok()?;
+    let out = run_git_capped(cwd, &["status", "--short"], 16 * 1024).ok()?;
     let trimmed = out.trim();
     if trimmed.is_empty() {
         None
@@ -686,7 +742,7 @@ fn stream_git_diff_to_artifact(
     let mut child = Command::new("git")
         .args(["-c", "core.hooksPath=/dev/null"])
         .args([
-            "diff",
+            "diff", "--no-color",
             "--cached",
             "--binary",
             "--full-index",

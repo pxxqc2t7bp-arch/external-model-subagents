@@ -57,6 +57,9 @@ pub fn load_http_adapters() -> Vec<HttpHarnessAdapter> {
 }
 
 fn parse_adapter(item: &Value) -> Option<HttpHarnessAdapter> {
+    if !item.as_object()?.keys().all(|k| matches!(k.as_str(),
+        "$schema" | "id" | "strengths" | "endpoint" | "api_key_env" | "default_model"
+        | "models" | "format" | "response_format" | "extra_headers")) { return None; }
     let field = |name: &str| item[name].as_str().map(str::trim).filter(|s| !s.is_empty());
     let id = canonical_harness_id(item["id"].as_str()?);
     let api_key_env = field("api_key_env")?;
@@ -142,6 +145,7 @@ impl HttpHarnessAdapter {
             program, args: ["-q", "-sS", "-N", "-w", "\n__HTTP_STATUS__:%{http_code}\n", "-K", "-"].map(String::from).into(),
             envs: Vec::new(), env_remove: vec![key_env.into()],
             stdin_data: Some(config), cwd: req.cwd.clone(), output_file: None,
+            temp_files: Vec::new(),
         })
     }
 
@@ -161,6 +165,15 @@ impl HarnessAdapter for HttpHarnessAdapter {
     fn response_key_env(&self) -> Option<&str> { Some(&self.api_key_env) }
     fn build_base(&self, req: &RunRequest) -> Result<CommandSpec, String> {
         self.build_request(req, &self.api_key_env)
+    }
+
+    fn on_stdout_line_bounded(&self, line: &str, truncated: bool, state: &mut ParseState) {
+        if truncated && line.trim_start().starts_with("data:") {
+            state.is_error = true;
+            state.last_message = Some("HTTP SSE data line exceeded the line cap and was truncated".into());
+            return;
+        }
+        self.on_stdout_line(line, state);
     }
 
     fn on_stdout_line(&self, line: &str, state: &mut ParseState) {
@@ -197,7 +210,8 @@ impl HarnessAdapter for HttpHarnessAdapter {
                 state.http_reasoning_end = Some(REASONING_OPEN.len());
             }
             if let Some(end) = &mut state.http_reasoning_end {
-                let text = &text[..text.floor_char_boundary(REPLY_CAP - message.len())];
+                let remaining = (REPLY_CAP / 2 - *end - REASONING_CLOSE.len()).min(REPLY_CAP - message.len());
+                let text = &text[..text.floor_char_boundary(remaining)];
                 message.insert_str(*end, text);
                 *end += text.len();
             }

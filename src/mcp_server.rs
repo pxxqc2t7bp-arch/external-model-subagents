@@ -10,8 +10,7 @@ use crate::stream::read_bounded_line;
 use serde_json::{json, Value};
 use std::io::{self, BufReader};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -26,8 +25,12 @@ pub fn serve_stdio() -> i32 {
     let mut reader = BufReader::with_capacity(8192, stdin.lock());
     let mut scratch = Vec::with_capacity(4096);
 
-    while let Ok(Some((line, _))) = read_bounded_line(&mut reader, &mut scratch, MAX_RPC_LINE_BYTES)
+    while let Ok(Some((line, truncated))) = read_bounded_line(&mut reader, &mut scratch, MAX_RPC_LINE_BYTES)
     {
+        if truncated {
+            writer.send_error(Value::Null, -32600, "request exceeds maximum line length");
+            continue;
+        }
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
@@ -50,7 +53,7 @@ pub fn serve_stdio() -> i32 {
     0
 }
 
-fn handle_message(msg: Value, writer: &RpcWriter, active: &ActiveRequests) {
+fn handle_message(mut msg: Value, writer: &RpcWriter, active: &ActiveRequests) {
     let method = msg.get("method").and_then(Value::as_str).unwrap_or("");
     let id_opt = msg.get("id").cloned();
 
@@ -95,7 +98,7 @@ fn handle_message(msg: Value, writer: &RpcWriter, active: &ActiveRequests) {
             let Some(id) = id_opt else {
                 return;
             };
-            spawn_tool_call(id, msg.get("params").cloned().unwrap_or(Value::Null), writer, active);
+            spawn_tool_call(id, msg.get_mut("params").map(Value::take).unwrap_or(Value::Null), writer, active);
         }
         _ => {
             if let Some(id) = id_opt {
@@ -105,13 +108,13 @@ fn handle_message(msg: Value, writer: &RpcWriter, active: &ActiveRequests) {
     }
 }
 
-fn spawn_tool_call(id: Value, params: Value, writer: &RpcWriter, active: &ActiveRequests) {
+fn spawn_tool_call(id: Value, mut params: Value, writer: &RpcWriter, active: &ActiveRequests) {
     let tool_name = params
         .get("name")
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_string();
-    let args = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
+    let args = params.get_mut("arguments").map(Value::take).unwrap_or_else(|| json!({}));
     let progress_token = params
         .get("_meta")
         .and_then(|m| m.get("progressToken"))
@@ -157,28 +160,30 @@ fn spawn_tool_call(id: Value, params: Value, writer: &RpcWriter, active: &Active
         .stack_size(WORKER_STACK)
         .spawn(move || {
             let progress_state = Arc::new(ProgressState::default());
-            let hb_done = Arc::new(AtomicBool::new(false));
-            if let Some(tok) = progress_token {
+            let hb_done = Arc::new((Mutex::new(false), Condvar::new()));
+            let heartbeat = progress_token.map(|tok| {
                 let w_hb = writer_c.clone();
                 let done_hb = Arc::clone(&hb_done);
                 let prog_hb = Arc::clone(&progress_state);
-                let _ = thread::Builder::new()
+                thread::Builder::new()
                     .name("ext-progress".into())
-                    .stack_size(128 * 1024)
+                    .stack_size(WORKER_STACK)
                     .spawn(move || {
-                        while !done_hb.load(Ordering::Acquire) {
-                            thread::sleep(Duration::from_secs(5));
-                            if done_hb.load(Ordering::Acquire) {
-                                break;
-                            }
+                        loop {
+                            let (lock, wake) = &*done_hb;
+                            let done = lock.lock().unwrap_or_else(|e| e.into_inner());
+                            let (done, _) = wake.wait_timeout_while(done, Duration::from_secs(5), |d| !*d)
+                                .unwrap_or_else(|e| e.into_inner());
+                            if *done { break; }
+                            drop(done);
                             w_hb.send(&json!({
                                 "jsonrpc": "2.0",
                                 "method": "notifications/progress",
                                 "params": prog_hb.notification(&tok)
                             }));
                         }
-                    });
-            }
+                    })
+            });
 
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 match tool_name.as_str() {
@@ -202,8 +207,17 @@ fn spawn_tool_call(id: Value, params: Value, writer: &RpcWriter, active: &Active
                 }
             }));
 
-            hb_done.store(true, Ordering::Release);
-            active_c.remove(&req_key);
+            if let Some(handle) = heartbeat {
+                let (lock, wake) = &*hb_done;
+                *lock.lock().unwrap_or_else(|e| e.into_inner()) = true;
+                wake.notify_one();
+                match handle {
+                    Ok(h) => if let Err(panic) = h.join() {
+                        eprintln!("{}", record_worker_panic(&req_key, panic.as_ref()));
+                    },
+                    Err(e) => eprintln!("failed to start progress thread: {e}"),
+                }
+            }
             match outcome {
                 Ok((is_err, text)) => {
                     writer_c.send_result(
@@ -219,10 +233,11 @@ fn spawn_tool_call(id: Value, params: Value, writer: &RpcWriter, active: &Active
                     writer_c.send_error(id_worker, -32603, &err.to_string());
                 }
             }
+            active_c.remove(&req_key);
         });
 
     if let Err(e) = res {
-        active.remove(&req_key_err);
         writer.send_error(id, -32603, &format!("failed to spawn worker thread: {e}"));
+        active.remove(&req_key_err);
     }
 }

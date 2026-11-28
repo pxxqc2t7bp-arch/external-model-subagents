@@ -85,9 +85,9 @@ impl ActiveRequests {
 
 pub fn id_to_key(id: &Value) -> String {
     match id {
-        Value::String(s) => s.clone(),
-        Value::Number(n) => n.to_string(),
-        other => other.to_string(),
+        Value::String(s) => format!("s:{s}"),
+        Value::Number(n) => format!("n:{n}"),
+        other => format!("j:{other}"),
     }
 }
 
@@ -114,7 +114,7 @@ pub fn tools_schema() -> Value {
                     "review_base": { "type": "string", "description": "Git branch/commit or 'uncommitted' for adversarial diff review." },
                     "handoff_from": { "type": "string", "description": "Previous `id` (`c...`) to pipe locally without re-copying text." },
                     "context_files": { "type": "array", "items": { "type": "string" }, "description": "File paths to attach locally." },
-                    "session_id": { "type": "string", "description": "Session ID or 'last' to resume." },
+                    "session_id": { "type": "string", "description": "Session ID or 'last' to resume (single-target only)." },
                     "keep_session": { "type": "boolean", "description": "Persist session on disk for multi-turn reuse." },
                     "targets": {
                         "type": "array",

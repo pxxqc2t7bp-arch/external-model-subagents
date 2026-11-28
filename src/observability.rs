@@ -1,7 +1,7 @@
 //! Opt-in append-only logging; configuration is frozen on the first event.
 use serde_json::Value;
 use std::fs::{File, OpenOptions};
-use std::io::{self, Cursor, Write};
+use std::io::{Cursor, Write};
 use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -34,12 +34,17 @@ fn config() -> Option<&'static Config> {
                 "human" => false, "json" => true,
                 _ => return Err("EXT_MODELS_LOG_FORMAT must be human|json".into()),
             };
-            match std::fs::metadata(&path) {
-                Ok(meta) if !meta.is_file() => return Err("log path must be a regular file".into()),
-                Err(err) if err.kind() != io::ErrorKind::NotFound => return Err(err.into()),
-                _ => {}
+            let mut options = OpenOptions::new();
+            options.create(true).append(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
             }
-            let file = OpenOptions::new().create(true).append(true).open(&path)?;
+            let file = options.open(&path)?;
+            if !file.metadata()?.is_file() {
+                return Err("log path must be a regular file".into());
+            }
             Ok(Config { file: Mutex::new(file), level, json })
         };
         match load() {

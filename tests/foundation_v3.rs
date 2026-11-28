@@ -2,10 +2,13 @@ use ext_models_mcp::error::{record_worker_panic, ErrorKind, RichError};
 use ext_models_mcp::harness::catalog::{resolve_route_rich, HarnessInventory};
 use ext_models_mcp::harness::codex::CodexAdapter;
 use ext_models_mcp::harness::{
-    execute_dispatch, CapabilityMode, HarnessAdapter, ProjectRulesMode, RunRequest, WorkMode,
+    CapabilityMode, HarnessAdapter, ProjectRulesMode, RunRequest, WorkMode,
 };
 use ext_models_mcp::sandbox::WorktreeSession;
 use ext_models_mcp::stream::cleanup_expired_artifacts_in;
+#[cfg(unix)]
+use ext_models_mcp::harness::execute_dispatch;
+#[cfg(unix)]
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, FileTimes};
@@ -14,12 +17,18 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::AtomicBool;
+#[cfg(unix)]
 use std::sync::Arc;
+use std::sync::Mutex;
+
+static ENV_LOCK: Mutex<()> = Mutex::new(());
+#[cfg(unix)]
 use std::thread;
 use std::time::{Duration, SystemTime};
 
 #[test]
 fn worktree_drop_cleans_up_automatically_on_panic() {
+    let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let base = std::env::temp_dir().join(format!("ext-wt-drop-{}", std::process::id()));
     let _ = fs::remove_dir_all(&base);
     let repo = base.join("repo");
@@ -47,7 +56,7 @@ fn worktree_drop_cleans_up_automatically_on_panic() {
     let call_id = format!("drop_panic_{}", std::process::id());
     let mut captured_wt = PathBuf::new();
     let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let ws = WorktreeSession::create(&repo, &call_id).unwrap();
+        let ws = WorktreeSession::create(&repo, &call_id, &AtomicBool::new(false)).unwrap();
         captured_wt = ws.worktree_cwd.clone();
         assert!(captured_wt.exists());
         panic!("simulated worker panic before finalize");
@@ -75,6 +84,7 @@ fn worktree_drop_cleans_up_automatically_on_panic() {
 
 #[test]
 fn artifact_ttl_cleanup_removes_expired_files_only() {
+    let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let dir = std::env::temp_dir().join(format!("ext-ttl-test-{}", std::process::id()));
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).unwrap();
@@ -102,6 +112,7 @@ fn artifact_ttl_cleanup_removes_expired_files_only() {
 
 #[test]
 fn provider_scoped_version_mismatch_allows_openai_switch_and_codex_disables_plugins() {
+    let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut invs = BTreeMap::new();
     let mut codex_inv = HarnessInventory {
         default_provider: Some("ferry".into()),
@@ -181,7 +192,7 @@ fn provider_scoped_version_mismatch_allows_openai_switch_and_codex_disables_plug
         };
         let mut spec = codex.build_base(&req).unwrap();
         codex.apply_headless_guard(&mut spec);
-        codex.apply_capabilities(&CapabilityMode::Code, &codex_inv, req.cwd.as_path(), &mut spec);
+        codex.apply_capabilities(&CapabilityMode::Code, &codex_inv, &req, &mut spec).unwrap();
         assert!(
             spec.args
                 .iter()
@@ -194,6 +205,7 @@ fn provider_scoped_version_mismatch_allows_openai_switch_and_codex_disables_plug
 
 #[test]
 fn rich_error_and_panic_artifact_recording_are_actionable() {
+    let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let err = RichError::new(ErrorKind::InvalidInput, "bad field")
         .with_suggestion("Use `mode: \"plan\"`");
     let rendered = err.to_string();
@@ -214,6 +226,7 @@ fn rich_error_and_panic_artifact_recording_are_actionable() {
 #[cfg(unix)]
 #[test]
 fn concurrent_dispatch_session_rwlock_has_zero_deadlocks() {
+    let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let base = std::env::temp_dir().join(format!("ext-conc-test-{}", std::process::id()));
     let _ = fs::remove_dir_all(&base);
     let bin_dir = base.join("bin");
@@ -222,7 +235,7 @@ fn concurrent_dispatch_session_rwlock_has_zero_deadlocks() {
     let fake_cli = bin_dir.join("fast-mock");
     fs::write(
         &fake_cli,
-        "#!/bin/sh\ncat >/dev/null\necho '{\"reply\":\"OK\"}'\n",
+        "#!/bin/sh\ncat >/dev/null\necho '{\"reply\":\"OK\",\"session_id\":\"mock-session\"}'\n",
     )
     .unwrap();
     fs::set_permissions(&fake_cli, fs::Permissions::from_mode(0o755)).unwrap();
@@ -233,7 +246,7 @@ fn concurrent_dispatch_session_rwlock_has_zero_deadlocks() {
         serde_json::to_string(&json!({
             "harnesses": [{
                 "id": "fastmock",
-                "binary": "fast-mock",
+                "binary": fake_cli,
                 "args": [],
                 "plan_flags": [],
                 "write_flags": [],
@@ -246,8 +259,7 @@ fn concurrent_dispatch_session_rwlock_has_zero_deadlocks() {
     )
     .unwrap();
 
-    let prev_path = std::env::var("PATH").unwrap_or_default();
-    std::env::set_var("PATH", format!("{}:{prev_path}", bin_dir.display()));
+    let previous = std::env::var_os("EXT_MODELS_HARNESSES_FILE");
     std::env::set_var("EXT_MODELS_HARNESSES_FILE", &cfg);
 
     let mut handles = Vec::new();
@@ -264,12 +276,16 @@ fn concurrent_dispatch_session_rwlock_has_zero_deadlocks() {
                 }),
                 Arc::new(AtomicBool::new(false)),
             );
+            assert!(out.contains("session_id=mock-session"), "{out}");
             assert!(!is_err, "concurrent dispatch {i} failed: {out}");
         }));
     }
-    for h in handles {
-        h.join().unwrap();
+    let results: Vec<_> = handles.into_iter().map(|h| h.join()).collect();
+    match previous {
+        Some(value) => std::env::set_var("EXT_MODELS_HARNESSES_FILE", value),
+        None => std::env::remove_var("EXT_MODELS_HARNESSES_FILE"),
     }
+    for result in results { result.unwrap(); }
 
     let _ = fs::remove_dir_all(&base);
 }

@@ -9,8 +9,9 @@ use ext_models_mcp::harness::{build_status_report_with_options, execute_dispatch
 use ext_models_mcp::mcp_server::serve_stdio;
 use serde_json::{json, Map, Value};
 use std::env;
-use std::io::{self, IsTerminal, Read};
-use std::path::PathBuf;
+use std::io::{self, IsTerminal};
+use std::path::{Path, PathBuf};
+use ext_models_mcp::stream::{read_config, read_input};
 use std::process;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
@@ -81,101 +82,28 @@ fn cmd_run(args: &[String]) -> i32 {
     let mut i = 0;
     while i < args.len() {
         let flag = args[i].as_str();
-        let next = args.get(i + 1);
-        match flag {
-            "--harness" | "-H" if next.is_some() => {
-                obj.insert("harness".into(), json!(next.unwrap()));
+        let key = match flag {
+            "--harness" | "-H" => "harness",
+            "--provider" | "-P" => "provider",
+            "--model" | "-m" => "model",
+            "--effort" => "effort",
+            "--cwd" | "-C" => "cwd",
+            "--mode" => "mode",
+            "--rules" | "--project-rules" => "project_rules",
+            "--caps" | "--capabilities" => "capabilities",
+            "--mcp" => "mcps",
+            "--file" => "context_files",
+            "--handoff" => "handoff_from",
+            "--review" => "review_base",
+            "--session" | "--resume" => "session_id",
+            "--swarm" => "swarm",
+            "--timeout-ms" => "timeout_ms",
+            "--max-chars" => "max_chars",
+            "--keep-session" | "--worktree" | "-w" => {
+                let key = if flag == "--keep-session" { "keep_session" } else { "worktree" };
+                obj.insert(key.into(), json!(true));
                 i += 1;
-            }
-            "--provider" | "-P" if next.is_some() => {
-                obj.insert("provider".into(), json!(next.unwrap()));
-                i += 1;
-            }
-            "--model" | "-m" if next.is_some() => {
-                obj.insert("model".into(), json!(next.unwrap()));
-                i += 1;
-            }
-            "--effort" if next.is_some() => {
-                obj.insert("effort".into(), json!(next.unwrap()));
-                i += 1;
-            }
-            "--cwd" | "-C" if next.is_some() => {
-                obj.insert("cwd".into(), json!(next.unwrap()));
-                i += 1;
-            }
-            "--mode" if next.is_some() => {
-                obj.insert("mode".into(), json!(next.unwrap()));
-                i += 1;
-            }
-            "--rules" | "--project-rules" if next.is_some() => {
-                obj.insert("project_rules".into(), json!(next.unwrap()));
-                i += 1;
-            }
-            "--caps" | "--capabilities" if next.is_some() => {
-                obj.insert("capabilities".into(), json!(next.unwrap()));
-                i += 1;
-            }
-            "--mcp" if next.is_some() => {
-                mcps.push(json!(next.unwrap()));
-                i += 1;
-            }
-            "--file" if next.is_some() => {
-                context_files.push(json!(next.unwrap()));
-                i += 1;
-            }
-            "--handoff" if next.is_some() => {
-                obj.insert("handoff_from".into(), json!(next.unwrap()));
-                i += 1;
-            }
-            "--review" if next.is_some() => {
-                obj.insert("review_base".into(), json!(next.unwrap()));
-                i += 1;
-            }
-            "--session" | "--resume" if next.is_some() => {
-                obj.insert("session_id".into(), json!(next.unwrap()));
-                i += 1;
-            }
-            "--keep-session" => {
-                obj.insert("keep_session".into(), json!(true));
-            }
-            "--worktree" | "-w" => {
-                obj.insert("worktree".into(), json!(true));
-            }
-            "--swarm" if next.is_some() => {
-                let raw = next.unwrap();
-                let content = if raw.trim_start().starts_with('{') {
-                    raw.clone()
-                } else {
-                    match std::fs::read_to_string(raw) {
-                        Ok(txt) => txt,
-                        Err(e) => {
-                            eprintln!("Failed to read --swarm file '{raw}': {e}");
-                            return 2;
-                        }
-                    }
-                };
-                match serde_json::from_str::<Value>(&content) {
-                    Ok(v) => {
-                        obj.insert("swarm".into(), v);
-                    }
-                    Err(e) => {
-                        eprintln!("Invalid --swarm JSON: {e}");
-                        return 2;
-                    }
-                }
-                i += 1;
-            }
-            "--timeout-ms" if next.is_some() => {
-                if let Ok(n) = next.unwrap().parse::<u64>() {
-                    obj.insert("timeout_ms".into(), json!(n));
-                }
-                i += 1;
-            }
-            "--max-chars" if next.is_some() => {
-                if let Ok(n) = next.unwrap().parse::<u64>() {
-                    obj.insert("max_chars".into(), json!(n));
-                }
-                i += 1;
+                continue;
             }
             "--" => {
                 positional_prompt.extend_from_slice(&args[i + 1..]);
@@ -185,7 +113,62 @@ fn cmd_run(args: &[String]) -> i32 {
                 print_help();
                 return 0;
             }
-            other => positional_prompt.push(other.to_string()),
+            other if other.starts_with("--") => {
+                eprintln!("Unknown run option '{other}'");
+                return 2;
+            }
+            other => {
+                positional_prompt.push(other.to_string());
+                i += 1;
+                continue;
+            }
+        };
+        i += 1;
+        let Some(value) = args.get(i).filter(|v| {
+            !v.is_empty()
+                && !v.starts_with("--")
+                && !matches!(v.as_str(), "-H" | "-P" | "-C" | "-m" | "-w" | "-h")
+        }) else {
+            eprintln!("Missing value for {flag}");
+            return 2;
+        };
+        match key {
+            "mcps" => mcps.push(json!(value)),
+            "context_files" => context_files.push(json!(value)),
+            "timeout_ms" | "max_chars" => {
+                let Ok(n) = value.parse::<u64>() else {
+                    eprintln!("{flag} requires an unsigned integer, got '{value}'");
+                    return 2;
+                };
+                obj.insert(key.into(), json!(n));
+            }
+            "swarm" => {
+                let content;
+                let raw = if value.trim_start().starts_with('{') {
+                    value
+                } else {
+                    content = match read_config(Path::new(value)) {
+                        Ok(text) => text,
+                        Err(e) => {
+                            eprintln!("Failed to read --swarm file '{value}': {e}");
+                            return 2;
+                        }
+                    };
+                    &content
+                };
+                match serde_json::from_str(raw) {
+                    Ok(v) => {
+                        obj.insert(key.into(), v);
+                    }
+                    Err(e) => {
+                        eprintln!("Invalid --swarm JSON: {e}");
+                        return 2;
+                    }
+                }
+            }
+            _ => {
+                obj.insert(key.into(), json!(value));
+            }
         }
         i += 1;
     }
@@ -199,9 +182,13 @@ fn cmd_run(args: &[String]) -> i32 {
 
     let joined = positional_prompt.join(" ");
     let prompt = if (joined.is_empty() || joined == "-") && !io::stdin().is_terminal() {
-        let mut buf = String::new();
-        let _ = io::stdin().take(256 * 1024).read_to_string(&mut buf);
-        buf
+        match read_input(io::stdin().lock()) {
+            Ok(text) => text,
+            Err(e) => {
+                eprintln!("Failed to read prompt from stdin: {e}");
+                return 2;
+            }
+        }
     } else {
         joined
     };
@@ -210,7 +197,11 @@ fn cmd_run(args: &[String]) -> i32 {
     let cancel = Arc::new(AtomicBool::new(false));
     let (is_err, out) = execute_dispatch(&Value::Object(obj), cancel);
     println!("{out}");
-    if is_err { 1 } else { 0 }
+    if is_err {
+        1
+    } else {
+        0
+    }
 }
 
 fn print_help() {
@@ -225,6 +216,10 @@ fn print_help() {
            -H, --harness <codex|claude|trae|zcode|auto>\n  \
            -P, --provider <id>       Provider override (e.g. 'openai' vs 'litellm')\n  \
            -m, --model <id>          Model ID or shorthand\n  \
+           --effort <low|medium|high|xhigh|max>\n  \
+           --file <path>             Attach a context file (repeatable)\n  \
+           --timeout-ms <ms>         Total timeout in milliseconds\n  \
+           --max-chars <n>           Inline output character budget\n  \
            -C, --cwd <dir>           Target project directory\n  \
            --mode <plan|write|full>  Permission mode (default: plan)\n  \
            --rules <smart|on|off>    Project AGENTS.md/CLAUDE.md policy (default: smart)\n  \

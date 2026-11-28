@@ -84,7 +84,7 @@ pub fn execute_debate(
     let judge_res = env.run_target(
         &agent_to_target(&spec.judge), &prompt, None, None, false, budget,
     );
-    let mut winner = "TIE";
+    let mut winner = "INVALID";
     let mut confidence = 0.5_f32;
     let mut summary = "";
     if let Some(verdict) = judge_res.raw_body.lines().rev().take(25)
@@ -94,7 +94,8 @@ pub fn execute_debate(
         winner = match parts.next() {
             Some("PROPOSER") => "PROPOSER",
             Some("CHALLENGER") => "CHALLENGER",
-            _ => "TIE",
+            Some("TIE") => "TIE",
+            _ => "INVALID",
         };
         for part in parts {
             if let Some(value) = part.strip_prefix("confidence=") {
@@ -105,16 +106,17 @@ pub fn execute_debate(
             }
         }
     }
+    let failed = judge_res.failed || winner == "INVALID";
     crate::observability::event(
-        if judge_res.failed { "warn" } else { "info" },
+        if failed { "warn" } else { "info" },
         "swarm_debate_judge_finished",
         || serde_json::json!({
-            "failed": judge_res.failed,
+            "failed": failed,
             "winner": winner,
             "confidence": confidence,
         }),
     );
-    (judge_res.failed, format!(
+    (failed, format!(
         "[swarm=debate | winner={winner} | rounds={} | confidence={confidence:.2}]\n\n\
          ### Judge\n{}\n\nSummary: {summary}{report}",
         spec.rounds, judge_res.formatted

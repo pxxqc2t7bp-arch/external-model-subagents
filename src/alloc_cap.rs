@@ -128,6 +128,7 @@ unsafe impl GlobalAlloc for CappedAllocator {
         } else {
             // SAFETY: Shrinking allocation via `std::alloc::System`.
             let p = unsafe { System.realloc(ptr, layout, new_size) };
+            // A null realloc leaves the old block live, so dealloc will release old_size.
             if !p.is_null() {
                 release(old_size - new_size);
             }

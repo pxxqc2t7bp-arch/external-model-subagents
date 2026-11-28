@@ -8,7 +8,7 @@ use crate::harness::{
 use crate::sandbox::CommandSpec;
 use serde_json::Value;
 use std::env;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 pub struct ZCodeAdapter;
 
@@ -122,6 +122,7 @@ impl HarnessAdapter for ZCodeAdapter {
             stdin_data: None,
             cwd: req.cwd.clone(),
             output_file: None,
+            temp_files: Vec::new(),
         })
     }
 
@@ -151,12 +152,13 @@ impl HarnessAdapter for ZCodeAdapter {
         &self,
         caps: &CapabilityMode,
         _inv: &HarnessInventory,
-        _cwd: &Path,
+        _req: &RunRequest,
         spec: &mut CommandSpec,
-    ) {
+    ) -> Result<(), String> {
         if matches!(caps, CapabilityMode::Code) {
             spec.args.extend(["--toolsearch-mode".into(), "off".into()]);
         }
+        Ok(())
     }
 
     fn on_stdout_line(&self, line: &str, state: &mut ParseState) {

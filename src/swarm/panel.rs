@@ -26,7 +26,7 @@ pub fn execute_panel(
         });
         let res = env.run_target(
             &agent_to_target(agent),
-            &prompt,
+            &format!("You are {}.\n\n{prompt}", agent.role),
             handoff_from,
             None,
             false,

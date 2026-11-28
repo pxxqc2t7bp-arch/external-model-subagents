@@ -69,22 +69,23 @@ impl SwarmContext {
     /// Expand known placeholders once, leaving unknown ones verbatim.
     pub fn render_template(&self, tpl: &str, task: &str, prev_output: &str) -> String {
         let notes = self.notes.read().expect("swarm notes poisoned");
-        let mut rendered = String::with_capacity(tpl.len());
+        const LIMIT: usize = 128 * 1024;
+        let mut rendered = String::with_capacity(tpl.len().min(LIMIT));
         for chunk in tpl.split_inclusive('}') {
-            let Some((prefix, key)) = chunk.strip_suffix('}').and_then(|s| s.rsplit_once('{')) else {
-                rendered.push_str(chunk);
-                continue;
-            };
-            let value = match key {
-                "task" => Some(task),
-                "prev_output" => Some(prev_output),
-                _ => key.strip_prefix("context.").and_then(|key| notes.get(key)).map(String::as_str),
-            };
-            if let Some(value) = value {
-                rendered.push_str(prefix);
-                rendered.push_str(value);
-            } else {
-                rendered.push_str(chunk);
+            let replacement = chunk.strip_suffix('}').and_then(|s| s.rsplit_once('{'))
+                .and_then(|(prefix, key)| {
+                    let value = match key {
+                        "task" => task,
+                        "prev_output" => prev_output,
+                        _ => notes.get(key.strip_prefix("context.")?)?,
+                    };
+                    Some((prefix, value))
+                });
+            let (prefix, value) = replacement.unwrap_or((chunk, ""));
+            for part in [prefix, value] {
+                let end = part.floor_char_boundary(LIMIT - rendered.len());
+                rendered.push_str(&part[..end]);
+                if end < part.len() || rendered.len() == LIMIT { return rendered; }
             }
         }
         rendered

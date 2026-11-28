@@ -10,7 +10,6 @@ use crate::harness::{
 };
 use crate::sandbox::CommandSpec;
 use serde_json::Value;
-use std::path::Path;
 
 pub struct ClaudeAdapter;
 
@@ -94,6 +93,7 @@ impl HarnessAdapter for ClaudeAdapter {
             stdin_data: Some(prompt_body),
             cwd: req.cwd.clone(),
             output_file: None,
+            temp_files: Vec::new(),
         })
     }
 
@@ -134,32 +134,30 @@ impl HarnessAdapter for ClaudeAdapter {
         &self,
         caps: &CapabilityMode,
         _inv: &HarnessInventory,
-        cwd: &Path,
+        req: &RunRequest,
         spec: &mut CommandSpec,
-    ) {
+    ) -> Result<(), String> {
         match caps {
             CapabilityMode::Code => {
                 spec.args.push("--strict-mcp-config".into());
                 spec.envs
                     .push(("CLAUDE_CODE_SKIP_PLUGIN_MCP_SERVERS".into(), "1".into()));
             }
-            CapabilityMode::Selective(allowed) => {
-                let inline = build_claude_mcp_config(cwd, Some(allowed));
-                spec.args.extend([
-                    "--strict-mcp-config".into(),
-                    "--mcp-config".into(),
-                    inline,
-                ]);
-            }
-            CapabilityMode::Full => {
-                let inline = build_claude_mcp_config(cwd, None);
-                spec.args.extend([
-                    "--strict-mcp-config".into(),
-                    "--mcp-config".into(),
-                    inline,
-                ]);
+            CapabilityMode::Selective(_) | CapabilityMode::Full => {
+                let filter = match caps {
+                    CapabilityMode::Selective(names) => Some(names.as_slice()),
+                    _ => None,
+                };
+                let config = build_claude_mcp_config(&req.cwd, filter);
+                let path = crate::stream::write_artifact_bytes(
+                    &format!("{}-claude-mcp.json", req.call_id), config.as_bytes(),
+                )?;
+                spec.args.extend(["--strict-mcp-config".into(), "--mcp-config".into(),
+                    path.to_string_lossy().into_owned()]);
+                spec.temp_files.push(path);
             }
         }
+        Ok(())
     }
 
     fn max_stdout_line_bytes(&self) -> usize {

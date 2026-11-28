@@ -39,6 +39,18 @@ ext-models-mcp debug c12345_1
 ext-models-mcp replay c12345_1
 ```
 
+## Harness configuration and trust
+
+With `capabilities="full"`, the worker can invoke configured MCP servers and plugins with their own credentials and permissions. Those tools can read, change, or transmit data outside a Git worktree. Enable full access only for trusted user and project configurations. Codex and Claude filter the hub's recursive and computer-use MCP names. On Trae, `project_rules="off"` supplies best-effort prompt guidance because `traecli` lacks a native rule-disable flag.
+
+| File | Supported fields |
+| --- | --- |
+| `harnesses.json` | Each CLI entry requires `id` and `binary`. Optional fields are `strengths`, `args`, `plan_flags`, `write_flags`, `full_flags`, `prompt_via_stdin` and `json_result_field`. Argument templates expand `{cwd}`, `{model}` and `{prompt}` once. |
+| `http-harnesses.json` | Each entry requires `id`, `endpoint`, `api_key_env` and `default_model`. Optional fields are `strengths`, `models`, `extra_headers` and `response_format` (alias `format`), which accepts `openai_sse` or `anthropic_sse`. |
+| `models.json` | Maps each harness name to an object of provider names and their arrays of model ID strings. |
+
+The two harness files accept an array of entries or an object containing a `harnesses` array. Both support `$schema` metadata. Set `EXT_MODELS_HARNESSES_FILE`, `EXT_MODELS_HTTP_HARNESSES_FILE` or `EXT_MODELS_CATALOG_FILE` to select the corresponding file.
+
 ## Environment Variables
 
 | Variable | Default | Purpose |

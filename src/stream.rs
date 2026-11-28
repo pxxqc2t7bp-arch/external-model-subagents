@@ -20,41 +20,8 @@ static TTL_SWEEP_ONCE: OnceLock<()> = OnceLock::new();
 mod sys {
     use std::fs;
     use std::io;
-    use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+    use std::os::unix::fs::OpenOptionsExt;
     use std::path::Path;
-
-    pub fn ensure_secure_dir(base: &Path) -> io::Result<()> {
-        match fs::symlink_metadata(base) {
-            Ok(meta) => {
-                if meta.file_type().is_symlink() || !meta.file_type().is_dir() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::PermissionDenied,
-                        format!("artifact path {} is not a real directory", base.display()),
-                    ));
-                }
-                let uid = unsafe { libc::geteuid() };
-                if meta.uid() != uid {
-                    return Err(io::Error::new(
-                        io::ErrorKind::PermissionDenied,
-                        format!(
-                            "artifact directory {} is not owned by current user",
-                            base.display()
-                        ),
-                    ));
-                }
-                if meta.permissions().mode() & 0o777 != 0o700 {
-                    let _ = fs::set_permissions(base, fs::Permissions::from_mode(0o700));
-                }
-                Ok(())
-            }
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                let mut builder = fs::DirBuilder::new();
-                builder.recursive(true).mode(0o700);
-                builder.create(base)
-            }
-            Err(e) => Err(e),
-        }
-    }
 
     pub fn open_secure_writer(path: &Path) -> io::Result<fs::File> {
         fs::OpenOptions::new()
@@ -73,22 +40,6 @@ mod sys {
     use std::io;
     use std::path::Path;
 
-    pub fn ensure_secure_dir(base: &Path) -> io::Result<()> {
-        match fs::symlink_metadata(base) {
-            Ok(meta) => {
-                if meta.file_type().is_symlink() || !meta.file_type().is_dir() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::PermissionDenied,
-                        format!("artifact path {} is not a real directory", base.display()),
-                    ));
-                }
-                Ok(())
-            }
-            Err(e) if e.kind() == io::ErrorKind::NotFound => fs::create_dir_all(base),
-            Err(e) => Err(e),
-        }
-    }
-
     pub fn open_secure_writer(path: &Path) -> io::Result<fs::File> {
         if let Ok(meta) = fs::symlink_metadata(path) {
             if meta.file_type().is_symlink() {
@@ -106,6 +57,47 @@ mod sys {
     }
 }
 
+fn ensure_secure_dir(base: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+
+    let meta = match fs::symlink_metadata(base) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            let mut builder = fs::DirBuilder::new();
+            builder.recursive(true);
+            #[cfg(unix)]
+            builder.mode(0o700);
+            match builder.create(base) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(e) => return Err(e),
+            }
+            fs::symlink_metadata(base)?
+        }
+        Err(e) => return Err(e),
+    };
+    if !meta.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("artifact path {} is not a real directory", base.display()),
+        ));
+    }
+    #[cfg(unix)]
+    {
+        if meta.uid() != unsafe { libc::geteuid() } {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("artifact directory {} is not owned by current user", base.display()),
+            ));
+        }
+        if meta.permissions().mode() & 0o777 != 0o700 {
+            fs::set_permissions(base, fs::Permissions::from_mode(0o700))?;
+        }
+    }
+    Ok(())
+}
+
 /// Generate a short deterministic call ID (`c<pid>_<seq>`) for zero-copy handoff files.
 pub fn next_call_id() -> String {
     let seq = CALL_SEQ.fetch_add(1, Ordering::Relaxed);
@@ -115,14 +107,14 @@ pub fn next_call_id() -> String {
 /// Ensure `<temp_dir>/ext-models` exists as an owner-only non-symlink directory and run lazy TTL sweep once.
 pub fn artifact_dir() -> io::Result<PathBuf> {
     let base = std::env::temp_dir().join("ext-models");
-    sys::ensure_secure_dir(&base)?;
+    ensure_secure_dir(&base)?;
     TTL_SWEEP_ONCE.get_or_init(|| {
         let days = std::env::var("EXT_MODELS_ARTIFACT_TTL_DAYS")
             .ok()
             .and_then(|s| s.trim().parse::<u64>().ok())
             .unwrap_or(DEFAULT_ARTIFACT_TTL_DAYS);
         if days > 0 {
-            let _ = cleanup_expired_artifacts_in(&base, Duration::from_secs(days * 86_400));
+            let _ = cleanup_expired_artifacts_in(&base, Duration::from_secs(days.saturating_mul(86_400)));
         }
     });
     Ok(base)
@@ -175,10 +167,11 @@ pub fn open_artifact_writer(filename: &str) -> Result<(PathBuf, fs::File), Strin
 /// Write raw bytes to an owner-only (`0o600`, `O_NOFOLLOW`) artifact file under `/tmp/ext-models`.
 pub fn write_artifact_bytes(filename: &str, content: &[u8]) -> Result<PathBuf, String> {
     let (path, mut file) = open_artifact_writer(filename)?;
-    file.write_all(content)
-        .map_err(|e| format!("failed to write artifact {}: {e}", path.display()))?;
-    file.flush()
-        .map_err(|e| format!("failed to flush artifact {}: {e}", path.display()))?;
+    if let Err(e) = file.write_all(content).and_then(|()| file.flush()) {
+        drop(file);
+        let _ = fs::remove_file(&path);
+        return Err(format!("failed to write artifact {}: {e}", path.display()));
+    }
     Ok(path)
 }
 
@@ -189,19 +182,17 @@ pub fn write_artifact(filename: &str, content: &str) -> Option<PathBuf> {
 
 /// Resolve a `handoff_from` call ID (e.g. `"c1234_1"`) to its saved Markdown artifact content.
 pub fn read_handoff(call_id: &str, max_bytes: usize) -> Result<String, String> {
-    let safe_id: String = call_id
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
-        .collect();
-    if safe_id.is_empty() {
+    if call_id.is_empty() || call_id.len() > 128
+        || !call_id.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
+    {
         return Err(format!("invalid handoff_from id: '{call_id}'"));
     }
     let dir = artifact_dir().map_err(|e| e.to_string())?;
-    let exact = dir.join(format!("{safe_id}.md"));
+    let exact = dir.join(format!("{call_id}.md"));
     let target = if exact.exists() {
         exact
     } else {
-        let prefix = format!("{safe_id}-");
+        let prefix = format!("{call_id}-");
         fs::read_dir(&dir)
             .map_err(|e| e.to_string())?
             .filter_map(|e| e.ok())
@@ -211,7 +202,7 @@ pub fn read_handoff(call_id: &str, max_bytes: usize) -> Result<String, String> {
                     .and_then(|n| n.to_str())
                     .is_some_and(|n| n.starts_with(&prefix) && n.ends_with(".md"))
             })
-            .ok_or_else(|| format!("handoff artifact not found for '{safe_id}' in {}", dir.display()))?
+            .ok_or_else(|| format!("handoff artifact not found for '{call_id}' in {}", dir.display()))?
     };
     read_file_capped(&target, max_bytes)
 }
@@ -225,14 +216,32 @@ pub fn read_file_capped(path: &Path, max_bytes: usize) -> Result<String, String>
     file.take((max_bytes as u64).saturating_add(1))
         .read_to_end(&mut bytes)
         .map_err(|e| format!("failed to read {}: {e}", path.display()))?;
-    if bytes.len() <= max_bytes {
-        return Ok(String::from_utf8_lossy(&bytes).into_owned());
+    let truncated = bytes.len() > max_bytes;
+    if truncated {
+        bytes.truncate(max_bytes);
+        trim_incomplete_utf8_tail(&mut bytes);
     }
-    bytes.truncate(max_bytes);
-    trim_incomplete_utf8_tail(&mut bytes);
-    let mut clean = String::from_utf8_lossy(&bytes).into_owned();
-    clean.push_str("\n...[truncated file context]...");
+    let mut clean = String::from_utf8(bytes)
+        .unwrap_or_else(|err| String::from_utf8_lossy(err.as_bytes()).into_owned());
+    if truncated {
+        clean.push_str("\n...[truncated file context]...");
+    }
     Ok(clean)
+}
+
+/// Read a complete UTF-8 configuration or prompt, rejecting inputs over 256 KiB.
+pub fn read_input(reader: impl Read) -> io::Result<String> {
+    const LIMIT: usize = 256 * 1024;
+    let mut bytes = Vec::new();
+    reader.take(LIMIT as u64 + 1).read_to_end(&mut bytes)?;
+    if bytes.len() > LIMIT {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "input exceeds 256 KiB"));
+    }
+    String::from_utf8(bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+}
+
+pub fn read_config(path: &Path) -> io::Result<String> {
+    read_input(fs::File::open(path)?)
 }
 
 /// Read one `\n`-terminated line from `reader` keeping at most `max_bytes` in RAM,
@@ -321,19 +330,14 @@ impl TailBuffer {
         if crate::alloc_cap::is_near_soft_limit() && self.data.len() > 1024 {
             self.shrink_to(1024);
         }
-        if !self.data.is_empty() {
+        let line_cap = if self.data.is_empty() {
+            self.cap
+        } else {
             self.data.push('\n');
-        }
-        if line.len() >= self.cap {
-            let start = floor_char_boundary_from_end(line, self.cap);
-            self.data.clear();
-            self.data.push_str(&line[start..]);
-            return;
-        }
-        self.data.push_str(line);
-        if self.data.len() > self.cap {
-            self.shrink_to(self.cap);
-        }
+            self.cap / 2
+        };
+        self.data.push_str(&line[floor_char_boundary_from_end(line, line_cap)..]);
+        self.shrink_to(self.cap);
     }
 
     fn shrink_to(&mut self, target: usize) {
@@ -358,10 +362,10 @@ pub fn persist_and_budget(
     full_text: &str,
     budget_chars: usize,
 ) -> (String, Option<PathBuf>) {
-    let saved = write_artifact(&format!("{call_id}-{harness}.md"), full_text);
+    let saved = write_artifact_bytes(&format!("{call_id}-{harness}.md"), full_text.as_bytes());
     let char_count = full_text.chars().count();
     if char_count <= budget_chars || budget_chars == 0 {
-        return (full_text.to_string(), saved);
+        return (full_text.to_string(), saved.ok());
     }
     let head_n = (budget_chars * 3) / 4;
     let tail_n = budget_chars.saturating_sub(head_n);
@@ -379,13 +383,13 @@ pub fn persist_and_budget(
     let saved_hint = saved
         .as_ref()
         .map(|p| format!("; full text at {}", p.display()))
-        .unwrap_or_default();
+        .unwrap_or_else(|e| format!("; failed to save full text: {e}"));
     let truncated = format!(
         "{}\n\n[... truncated {omitted} chars{saved_hint} ...]\n\n{}",
         &full_text[..head_end],
         &full_text[tail_start..]
     );
-    (truncated, saved)
+    (truncated, saved.ok())
 }
 
 fn ceil_char_boundary(s: &str, mut idx: usize) -> usize {

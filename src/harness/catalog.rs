@@ -7,7 +7,7 @@
 
 use crate::error::{ErrorKind, RichError};
 use crate::harness::discovery::{bins, home_dir};
-use crate::stream::{artifact_dir, write_artifact};
+use crate::stream::{artifact_dir, read_config, write_artifact};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
@@ -24,6 +24,7 @@ pub struct HarnessInventory {
     /// `provider_id -> list of known model IDs` (empty list means pass-through gateway).
     pub providers: BTreeMap<String, Vec<String>>,
     pub mcps: Vec<String>,
+    pub blocked_mcps: Vec<String>,
     pub plugins: Vec<String>,
 }
 
@@ -120,7 +121,12 @@ pub fn resolve_route_rich(
             if let Some((lhs, rhs)) = raw_m.split_once('/') {
                 let known_prov = inventories.values().any(|inv| inv.providers.contains_key(lhs))
                     || lhs.eq_ignore_ascii_case("openai");
-                if known_prov && !rhs.is_empty() {
+                let direct_match = available_harnesses.iter()
+                    .filter(|h| norm_harness.as_ref().is_none_or(|target| target == *h))
+                    .filter_map(|h| inventories.get(h))
+                    .flat_map(|inv| inv.providers.values().flatten())
+                    .any(|model| model.eq_ignore_ascii_case(raw_m));
+                if !direct_match && known_prov && !rhs.is_empty() {
                     prov_opt = Some(lhs.to_string());
                     model_opt = Some(rhs.to_string());
                 }
@@ -504,7 +510,7 @@ fn scan_codex() -> HarnessInventory {
     }
 
     let mut catalog_json: Option<PathBuf> = None;
-    if let Ok(toml_text) = fs::read_to_string(codex_home.join("config.toml")) {
+    if let Ok(toml_text) = read_config(&codex_home.join("config.toml")) {
         parse_codex_toml(&toml_text, &mut inv, &mut catalog_json);
     }
 
@@ -563,8 +569,9 @@ fn parse_codex_toml(text: &str, inv: &mut HarnessInventory, catalog_json: &mut O
                 }
             } else if let Some(rest) = section.strip_prefix("mcp_servers.") {
                 let mcp = unquote_toml_seg(rest);
-                if !mcp.contains('.') && !is_poison_mcp(&mcp) && !inv.mcps.contains(&mcp) {
-                    inv.mcps.push(mcp);
+                let names = if is_poison_mcp(&mcp) { &mut inv.blocked_mcps } else { &mut inv.mcps };
+                if !names.contains(&mcp) {
+                    names.push(mcp);
                 }
             } else if let Some(rest) = section.strip_prefix("plugins.") {
                 let plug = unquote_toml_seg(rest);
@@ -596,15 +603,18 @@ fn scan_claude(cwd: &Path) -> HarnessInventory {
         auth_mode: "subscription_or_env".into(),
         ..Default::default()
     };
-    let claude_dir = env::var_os("CLAUDE_CONFIG_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home_dir().join(".claude"));
+    let claude_dir = claude_config_dir();
 
     let mut custom_gateway = env::var_os("ANTHROPIC_BASE_URL").is_some();
     let mut models = BTreeSet::new();
 
-    if let Ok(raw) = fs::read_to_string(claude_dir.join("settings.json")) {
-        if let Ok(v) = serde_json::from_str::<Value>(&raw) {
+    for (global_settings, v) in claude_configs(&claude_dir, cwd) {
+        if let Some(servers) = v["mcpServers"].as_object() {
+            for name in servers.keys() {
+                if !inv.mcps.contains(name) { inv.mcps.push(name.clone()); }
+            }
+        }
+        if global_settings {
             if let Some(m) = v.get("model").and_then(Value::as_str) {
                 inv.default_model = Some(m.to_string());
                 models.insert(m.to_string());
@@ -649,43 +659,43 @@ fn scan_claude(cwd: &Path) -> HarnessInventory {
             .insert("anthropic".into(), models.into_iter().collect());
     }
 
-    // Collect MCP server names from ~/.claude.json and <cwd>/.mcp.json.
-    for path in [home_dir().join(".claude.json"), cwd.join(".mcp.json")] {
-        if let Ok(raw) = fs::read_to_string(&path) {
-            if let Ok(v) = serde_json::from_str::<Value>(&raw) {
-                if let Some(servers) = v.get("mcpServers").and_then(Value::as_object) {
-                    for name in servers.keys() {
-                        if !is_poison_mcp(name) && !inv.mcps.contains(name) {
-                            inv.mcps.push(name.clone());
-                        }
-                    }
-                }
-            }
-        }
-    }
     inv
 }
 
-/// Build an inline `--mcp-config` JSON string for Claude containing ONLY allowed MCP definitions.
+fn claude_config_dir() -> PathBuf {
+    env::var_os("CLAUDE_CONFIG_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home_dir().join(".claude"))
+}
+
+fn claude_configs(claude_dir: &Path, cwd: &Path) -> impl Iterator<Item = (bool, Value)> {
+    [
+        claude_dir.join("settings.json"),
+        home_dir().join(".claude.json"),
+        cwd.join(".claude/settings.json"),
+        cwd.join(".claude/settings.local.json"),
+        cwd.join(".mcp.json"),
+    ]
+    .into_iter()
+    .enumerate()
+    .filter_map(|(index, path)| {
+        let raw = read_config(&path).ok()?;
+        let mut config: Value = serde_json::from_str(&raw).ok()?;
+        if let Some(servers) = config.get_mut("mcpServers").and_then(Value::as_object_mut) {
+            servers.retain(|name, _| !is_poison_mcp(name));
+        }
+        Some((index == 0, config))
+    })
+}
+
+/// Merge the allowed MCP definitions in increasing order of local precedence.
 pub fn build_claude_mcp_config(cwd: &Path, filter: Option<&[String]>) -> String {
     let mut merged = serde_json::Map::new();
-    for path in [home_dir().join(".claude.json"), cwd.join(".mcp.json")] {
-        if let Ok(raw) = fs::read_to_string(&path) {
-            if let Ok(v) = serde_json::from_str::<Value>(&raw) {
-                if let Some(servers) = v.get("mcpServers").and_then(Value::as_object) {
-                    for (name, cfg) in servers {
-                        if is_poison_mcp(name) {
-                            continue;
-                        }
-                        if let Some(allowed) = filter {
-                            if !allowed.iter().any(|a| a.eq_ignore_ascii_case(name)) {
-                                continue;
-                            }
-                        }
-                        merged.insert(name.clone(), cfg.clone());
-                    }
-                }
-            }
+    for (_, mut config) in claude_configs(&claude_config_dir(), cwd) {
+        if let Some(Value::Object(servers)) = config.get_mut("mcpServers").map(Value::take) {
+            merged.extend(servers.into_iter().filter(|(name, _)| {
+                filter.is_none_or(|allowed| allowed.iter().any(|a| a.eq_ignore_ascii_case(name)))
+            }));
         }
     }
     serde_json::json!({ "mcpServers": merged }).to_string()
@@ -790,28 +800,45 @@ fn scan_trae(probe_cli: bool) -> HarnessInventory {
 }
 
 fn apply_user_model_overrides(map: &mut BTreeMap<String, HarnessInventory>) {
-    let custom_path = env::var_os("EXT_MODELS_CATALOG_FILE")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            home_dir().join(".gemini/config/plugins/external-model-subagents/models.json")
-        });
-    let Ok(raw) = fs::read_to_string(custom_path) else {
-        return;
+    let explicit = env::var_os("EXT_MODELS_CATALOG_FILE");
+    let custom_path = explicit.as_ref().map(PathBuf::from).unwrap_or_else(|| {
+        home_dir().join(".gemini/config/plugins/external-model-subagents/models.json")
+    });
+    let warn = |error: &dyn std::fmt::Display| {
+        eprintln!(
+            "{}",
+            RichError::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "invalid catalog {} (expected {{harness: {{provider: [models]}}}}): {error}",
+                    custom_path.display()
+                )
+            )
+        );
     };
-    let Ok(Value::Object(root)) = serde_json::from_str::<Value>(&raw) else {
-        return;
+    let raw = match read_config(&custom_path) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound && explicit.is_none() => return,
+        Err(e) => {
+            warn(&e);
+            return;
+        }
     };
-    for (harness, prov_val) in root {
+    type Overrides = BTreeMap<String, BTreeMap<String, Vec<String>>>;
+    let overrides = match serde_json::from_str::<Overrides>(&raw) {
+        Ok(entries) => entries,
+        Err(e) => {
+            warn(&e);
+            return;
+        }
+    };
+    for (harness, providers) in overrides {
         let inv = map.entry(canonical_harness_id(&harness)).or_default();
-        if let Value::Object(provs) = prov_val {
-            for (prov, arr) in provs {
-                if let Value::Array(items) = arr {
-                    let entry = inv.providers.entry(prov).or_default();
-                    for item in items.iter().filter_map(Value::as_str) {
-                        if !entry.iter().any(|x| x == item) {
-                            entry.push(item.to_string());
-                        }
-                    }
+        for (provider, models) in providers {
+            let entry = inv.providers.entry(provider).or_default();
+            for model in models {
+                if !entry.contains(&model) {
+                    entry.push(model);
                 }
             }
         }
@@ -915,6 +942,11 @@ fn looks_like_model_id(s: &str) -> bool {
 }
 
 fn unquote_toml_seg(s: &str) -> String {
+    if let Some(quote @ ('"' | '\'')) = s.chars().next() {
+        if let Some((segment, _)) = s[1..].split_once(quote) {
+            return segment.to_string();
+        }
+    }
     let first = s.split('.').next().unwrap_or(s).trim();
     first.trim_matches('"').trim_matches('\'').to_string()
 }
