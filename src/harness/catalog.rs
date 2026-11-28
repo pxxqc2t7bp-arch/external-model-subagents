@@ -747,6 +747,16 @@ pub fn is_poison_mcp(name: &str) -> bool {
 }
 
 fn collect_json_model_slugs(path: &Path, out: &mut BTreeSet<String>) {
+    if crate::alloc_cap::is_near_soft_limit() {
+        return;
+    }
+    let Ok(meta) = fs::metadata(path) else {
+        return;
+    };
+    // Skip pathological multi-MB cache files that could spike JSON DOM memory under low heap caps.
+    if meta.len() > 768 * 1024 {
+        return;
+    }
     let Ok(raw) = fs::read_to_string(path) else {
         return;
     };

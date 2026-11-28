@@ -56,7 +56,8 @@ impl HarnessAdapter for CodexAdapter {
         }
 
         if let Some(ref prov) = req.provider {
-            args.extend(["-c".into(), format!("model_provider=\"{prov}\"")]);
+            let escaped = escape_toml_str(prov);
+            args.extend(["-c".into(), format!("model_provider=\"{escaped}\"")]);
             // When explicitly switching to official OpenAI subscription, clear custom catalog override.
             if prov.eq_ignore_ascii_case("openai") {
                 args.extend(["-c".into(), "model_catalog_json=\"\"".into()]);
@@ -66,7 +67,8 @@ impl HarnessAdapter for CodexAdapter {
             args.extend(["-m".into(), m.clone()]);
         }
         if let Some(ref eff) = req.effort {
-            args.extend(["-c".into(), format!("model_reasoning_effort=\"{eff}\"")]);
+            let escaped = escape_toml_str(eff);
+            args.extend(["-c".into(), format!("model_reasoning_effort=\"{escaped}\"")]);
         }
 
         args.push("--skip-git-repo-check".into());
@@ -87,18 +89,43 @@ impl HarnessAdapter for CodexAdapter {
         stdin_text.push_str(&req.effective_prompt);
 
         if let Some(ref base) = req.review_base {
-            args.push("review".into());
-            if base.eq_ignore_ascii_case("uncommitted") || base.eq_ignore_ascii_case("working") {
-                args.push("--uncommitted".into());
-            } else {
-                args.extend(["--base".into(), base.clone()]);
+            let is_uncommitted =
+                base.eq_ignore_ascii_case("uncommitted") || base.eq_ignore_ascii_case("working");
+            if req.worktree && is_uncommitted {
+                return Err(
+                    "worktree=true cannot be combined with review_base='uncommitted' \
+                     (worktree snapshots dirty state into a baseline commit; run read-only uncommitted review without worktree)"
+                        .into(),
+                );
             }
-            if !req.prompt.trim().is_empty() {
+            args.push("review".into());
+            let has_custom_input = !req.prompt.trim().is_empty()
+                || req.effective_prompt.starts_with("<previous_agent_handoff ")
+                || req.effective_prompt.starts_with("<context_file ");
+            if has_custom_input {
+                // `codex exec review` forbids combining `--base`/`--uncommitted` with `[PROMPT]` (`-`).
+                // Embed the target diff scope into the stdin prompt and pass `-` only.
+                let scope = if is_uncommitted {
+                    "Review Scope: Perform an adversarial code review of all uncommitted changes (staged, unstaged, and untracked files — inspect with `git status` and `git diff HEAD`).\n\n".to_string()
+                } else {
+                    format!(
+                        "Review Scope: Perform an adversarial code review of git changes against base '{base}' (inspect with `git diff {base}...HEAD` and `git log --oneline {base}..HEAD`).\n\n"
+                    )
+                };
+                stdin_text.insert_str(0, &scope);
                 args.push("-".into());
             } else {
+                if is_uncommitted {
+                    args.push("--uncommitted".into());
+                } else {
+                    args.extend(["--base".into(), base.clone()]);
+                }
                 stdin_text.clear();
             }
         } else if let Some(ref sid) = req.session_id {
+            if sid.starts_with('-') {
+                return Err(format!("invalid session_id '{sid}': must not start with '-'"));
+            }
             args.extend(["-C".into(), req.cwd.to_string_lossy().into_owned()]);
             args.push("resume".into());
             if sid.eq_ignore_ascii_case("last") {
@@ -146,10 +173,9 @@ impl HarnessAdapter for CodexAdapter {
         spec: &mut CommandSpec,
     ) {
         if rules == ProjectRulesMode::Off {
-            insert_before_subcmd(
-                &mut spec.args,
-                &["-c", "project_doc_max_bytes=0", "--ignore-rules"],
-            );
+            // Disable only `AGENTS.md` project docs (`project_doc_max_bytes=0`).
+            // Do NOT pass `--ignore-rules`, which disables Codex execpolicy `.rules` security controls.
+            insert_before_subcmd(&mut spec.args, &["-c", "project_doc_max_bytes=0"]);
         }
     }
 
@@ -228,4 +254,24 @@ fn insert_before_subcmd(args: &mut Vec<String>, extra: &[&str]) {
     for (offset, item) in extra.iter().enumerate() {
         args.insert(pos + offset, (*item).to_string());
     }
+}
+
+fn escape_toml_str(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\u{0008}' => out.push_str("\\b"),
+            '\t' => out.push_str("\\t"),
+            '\n' => out.push_str("\\n"),
+            '\u{000C}' => out.push_str("\\f"),
+            '\r' => out.push_str("\\r"),
+            c if (c as u32) < 0x20 || c == '\u{007F}' => {
+                out.push_str(&format!("\\u{:04X}", c as u32));
+            }
+            c => out.push(c),
+        }
+    }
+    out
 }
