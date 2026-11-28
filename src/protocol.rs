@@ -121,6 +121,10 @@ pub fn tools_schema() -> Value {
                         "description": "Up to 4 parallel targets: [{harness, provider, model, effort, prompt}].",
                         "items": { "type": "object" }
                     },
+                    "swarm": {
+                        "type": "object",
+                        "description": "Structured multi-agent collaboration: {type: 'panel'|'pipeline'|'debate', agents/stages/proposer+challenger+judge, consensus_threshold, rounds}."
+                    },
                     "timeout_ms": { "type": "integer", "description": "Total timeout ms (default 300000)." },
                     "max_chars": { "type": "integer", "description": "Inline output char budget (default 8000)." }
                 }
@@ -133,7 +137,8 @@ pub fn tools_schema() -> Value {
                 "type": "object",
                 "properties": {
                     "cwd": { "type": "string", "description": "Optional workspace path to include project-scoped MCPs." },
-                    "probe_models": { "type": "boolean", "description": "Refresh uncached dynamic CLI model lists (e.g. Trae)." }
+                    "probe_models": { "type": "boolean", "description": "Refresh uncached dynamic CLI model lists (e.g. Trae)." },
+                    "include_metrics": { "type": "boolean", "description": "Include process-local dispatch, swarm, routing and latency metrics." }
                 }
             }
         }

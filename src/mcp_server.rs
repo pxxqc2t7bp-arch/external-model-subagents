@@ -1,7 +1,10 @@
 //! Stdio JSON-RPC 2.0 loop (`0.0%` idle CPU, compact 256 KiB worker threads, progress heartbeats,
 //! and automatic child process-group cleanup on cancellation or `stdin` EOF).
 
-use crate::harness::{build_status_report, execute_dispatch};
+use crate::error::record_worker_panic;
+use crate::harness::{
+    build_status_report_with_options, execute_dispatch_with_progress, ProgressState,
+};
 use crate::protocol::{id_to_key, tools_schema, ActiveRequests, RpcWriter};
 use crate::stream::read_bounded_line;
 use serde_json::{json, Value};
@@ -119,6 +122,10 @@ fn spawn_tool_call(id: Value, params: Value, writer: &RpcWriter, active: &Active
             .get("probe_models")
             .and_then(Value::as_bool)
             .unwrap_or(false);
+        let include_metrics = args
+            .get("include_metrics")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         let cwd = args
             .get("cwd")
             .and_then(Value::as_str)
@@ -126,7 +133,7 @@ fn spawn_tool_call(id: Value, params: Value, writer: &RpcWriter, active: &Active
             .or_else(|| std::env::current_dir().ok())
             .unwrap_or_else(|| PathBuf::from("."));
         if !probe {
-            let text = build_status_report(&cwd, false);
+            let text = build_status_report_with_options(&cwd, false, include_metrics);
             writer.send_result(
                 id,
                 json!({
@@ -149,44 +156,47 @@ fn spawn_tool_call(id: Value, params: Value, writer: &RpcWriter, active: &Active
         .name("ext-rpc-worker".into())
         .stack_size(WORKER_STACK)
         .spawn(move || {
+            let progress_state = Arc::new(ProgressState::default());
             let hb_done = Arc::new(AtomicBool::new(false));
             if let Some(tok) = progress_token {
                 let w_hb = writer_c.clone();
                 let done_hb = Arc::clone(&hb_done);
+                let prog_hb = Arc::clone(&progress_state);
                 let _ = thread::Builder::new()
                     .name("ext-progress".into())
                     .stack_size(128 * 1024)
                     .spawn(move || {
-                        let mut step = 1u64;
                         while !done_hb.load(Ordering::Acquire) {
-                            thread::sleep(Duration::from_secs(15));
+                            thread::sleep(Duration::from_secs(5));
                             if done_hb.load(Ordering::Acquire) {
                                 break;
                             }
                             w_hb.send(&json!({
                                 "jsonrpc": "2.0",
                                 "method": "notifications/progress",
-                                "params": {
-                                    "progressToken": tok,
-                                    "progress": step,
-                                }
+                                "params": prog_hb.notification(&tok)
                             }));
-                            step += 1;
                         }
                     });
             }
 
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 match tool_name.as_str() {
-                    "dispatch" => execute_dispatch(&args, cancel_flag),
+                    "dispatch" => {
+                        execute_dispatch_with_progress(&args, cancel_flag, Some(progress_state))
+                    }
                     "status" => {
+                        let include_metrics = args
+                            .get("include_metrics")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false);
                         let cwd = args
                             .get("cwd")
                             .and_then(Value::as_str)
                             .map(PathBuf::from)
                             .or_else(|| std::env::current_dir().ok())
                             .unwrap_or_else(|| PathBuf::from("."));
-                        (false, build_status_report(&cwd, true))
+                        (false, build_status_report_with_options(&cwd, true, include_metrics))
                     }
                     other => (true, format!("Unknown tool: {other}")),
                 }
@@ -204,8 +214,9 @@ fn spawn_tool_call(id: Value, params: Value, writer: &RpcWriter, active: &Active
                         }),
                     );
                 }
-                Err(_) => {
-                    writer_c.send_error(id_worker, -32603, "internal worker panic");
+                Err(payload) => {
+                    let err = record_worker_panic(&req_key, payload.as_ref());
+                    writer_c.send_error(id_worker, -32603, &err.to_string());
                 }
             }
         });

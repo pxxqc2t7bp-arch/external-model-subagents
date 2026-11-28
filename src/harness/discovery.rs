@@ -3,7 +3,6 @@
 
 use std::env;
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -25,8 +24,9 @@ pub fn bins() -> &'static DiscoveredBins {
 
 pub fn home_dir() -> PathBuf {
     env::var_os("HOME")
+        .or_else(|| env::var_os("USERPROFILE"))
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/tmp"))
+        .unwrap_or_else(env::temp_dir)
 }
 
 pub fn find_binary(name: &str, env_override: Option<&str>) -> Option<PathBuf> {
@@ -42,6 +42,15 @@ pub fn find_binary(name: &str, env_override: Option<&str>) -> Option<PathBuf> {
         let candidate = dir.join(name);
         if is_executable(&candidate) {
             return Some(candidate);
+        }
+        #[cfg(windows)]
+        if Path::new(name).extension().is_none() {
+            for ext in ["exe", "cmd", "bat"] {
+                let with_ext = dir.join(format!("{name}.{ext}"));
+                if is_executable(&with_ext) {
+                    return Some(with_ext);
+                }
+            }
         }
     }
     None
@@ -144,8 +153,15 @@ fn collect_versioned_bins(root: &Path, sub: &str, out: &mut Vec<PathBuf>) {
     }
 }
 
+#[cfg(unix)]
 pub fn is_executable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
     fs::metadata(path)
         .map(|m| m.is_file() && (m.permissions().mode() & 0o111 != 0))
         .unwrap_or(false)
+}
+
+#[cfg(not(unix))]
+pub fn is_executable(path: &Path) -> bool {
+    fs::metadata(path).map(|m| m.is_file()).unwrap_or(false)
 }

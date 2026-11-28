@@ -4,11 +4,8 @@
 use crate::stream::{
     artifact_dir, open_artifact_writer, read_bounded_line, TailBuffer, MAX_LINE_BYTES,
 };
-use std::ffi::OsStr;
 use std::fs;
 use std::io::{BufReader, Read, Write};
-use std::os::unix::ffi::OsStrExt;
-use std::os::unix::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -18,6 +15,87 @@ use std::time::{Duration, Instant};
 
 const SMALL_STACK: usize = 256 * 1024;
 const STDERR_CAP: usize = 4 * 1024;
+
+#[cfg(unix)]
+mod sys {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::process::CommandExt;
+    use std::path::PathBuf;
+    use std::process::Command;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::thread;
+    use std::time::Duration;
+
+    pub fn configure_group(cmd: &mut Command) {
+        cmd.process_group(0);
+    }
+
+    pub fn terminate_process_group(pid: u32, finished: &AtomicBool) {
+        let Ok(pgid) = i32::try_from(pid) else {
+            return;
+        };
+        if pgid <= 0 {
+            return;
+        }
+        // SAFETY: `pgid` was created with `process_group(0)` so `-pgid` targets only our child group.
+        unsafe {
+            let _ = libc::kill(-pgid, libc::SIGTERM);
+        }
+        for _ in 0..25 {
+            if finished.load(Ordering::Acquire) {
+                return;
+            }
+            thread::sleep(Duration::from_millis(80));
+        }
+        if !finished.load(Ordering::Acquire) {
+            unsafe {
+                let _ = libc::kill(-pgid, libc::SIGKILL);
+            }
+        }
+    }
+
+    pub fn reap_group(pid: u32) {
+        if let Ok(pgid) = i32::try_from(pid) {
+            if pgid > 0 {
+                unsafe {
+                    let _ = libc::kill(-pgid, libc::SIGTERM);
+                }
+            }
+        }
+    }
+
+    pub fn bytes_to_path_buf(bytes: &[u8]) -> PathBuf {
+        PathBuf::from(OsStr::from_bytes(bytes))
+    }
+}
+
+#[cfg(not(unix))]
+mod sys {
+    use std::path::PathBuf;
+    use std::process::{Command, Stdio};
+    use std::sync::atomic::AtomicBool;
+
+    pub fn configure_group(_cmd: &mut Command) {}
+
+    pub fn terminate_process_group(pid: u32, _finished: &AtomicBool) {
+        if pid == 0 {
+            return;
+        }
+        let _ = Command::new("taskkill")
+            .args(["/F", "/T", "/PID", &pid.to_string()])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+
+    pub fn reap_group(_pid: u32) {}
+
+    pub fn bytes_to_path_buf(bytes: &[u8]) -> PathBuf {
+        PathBuf::from(String::from_utf8_lossy(bytes).into_owned())
+    }
+}
 
 /// Global concurrency semaphore limiting simultaneous external CLI child processes.
 pub struct JobPermit;
@@ -30,7 +108,7 @@ fn job_limiter() -> &'static (Mutex<usize>, Condvar, usize) {
             .ok()
             .and_then(|s| s.trim().parse::<usize>().ok())
             .unwrap_or(3)
-            .clamp(1, 8);
+            .clamp(1, 12);
         (Mutex::new(0), Condvar::new(), max_jobs)
     })
 }
@@ -124,8 +202,8 @@ where
             Stdio::null()
         })
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .process_group(0);
+        .stderr(Stdio::piped());
+    sys::configure_group(&mut cmd);
 
     for k in &spec.env_remove {
         cmd.env_remove(k);
@@ -137,7 +215,7 @@ where
     let mut child = cmd
         .spawn()
         .map_err(|e| format!("failed to spawn {}: {e}", spec.program.display()))?;
-    let pgid = child.id() as i32;
+    let pid = child.id();
 
     if let (Some(mut sin), Some(payload)) = (child.stdin.take(), spec.stdin_data.clone()) {
         let _ = thread::Builder::new()
@@ -195,17 +273,17 @@ where
                 let last_act = act_wd.load(Ordering::Relaxed);
                 if cancel.load(Ordering::Acquire) {
                     can_wd.store(true, Ordering::Release);
-                    terminate_process_group(pgid, &fin_wd);
+                    sys::terminate_process_group(pid, &fin_wd);
                     break;
                 }
                 if elapsed >= total_ms {
                     to_wd.store(true, Ordering::Release);
-                    terminate_process_group(pgid, &fin_wd);
+                    sys::terminate_process_group(pid, &fin_wd);
                     break;
                 }
                 if idle_ms > 0 && elapsed.saturating_sub(last_act) >= idle_ms {
                     idle_wd.store(true, Ordering::Release);
-                    terminate_process_group(pgid, &fin_wd);
+                    sys::terminate_process_group(pid, &fin_wd);
                     break;
                 }
             }
@@ -227,9 +305,7 @@ where
     let status = child.wait().map_err(|e| format!("wait error: {e}"))?;
     finished.store(true, Ordering::Release);
     // Ensure any stray background grandchildren in the process group are reaped.
-    unsafe {
-        libc::kill(-pgid, libc::SIGTERM);
-    }
+    sys::reap_group(pid);
 
     let _ = watchdog.join();
     let stderr_tail = stderr_handle.join().unwrap_or_default();
@@ -244,27 +320,6 @@ where
     })
 }
 
-fn terminate_process_group(pgid: i32, finished: &AtomicBool) {
-    if pgid <= 0 {
-        return;
-    }
-    // SAFETY: `pgid` was created with `process_group(0)` so `-pgid` targets only our child group.
-    unsafe {
-        libc::kill(-pgid, libc::SIGTERM);
-    }
-    for _ in 0..25 {
-        if finished.load(Ordering::Acquire) {
-            return;
-        }
-        thread::sleep(Duration::from_millis(80));
-    }
-    if !finished.load(Ordering::Acquire) {
-        unsafe {
-            libc::kill(-pgid, libc::SIGKILL);
-        }
-    }
-}
-
 /// Isolated Git worktree carrying uncommitted tracked & untracked changes from the main repo.
 pub struct WorktreeSession {
     pub repo_root: PathBuf,
@@ -273,6 +328,7 @@ pub struct WorktreeSession {
     baseline_tree: String,
     call_id: String,
     skipped_untracked: usize,
+    cleaned: bool,
 }
 
 pub struct WorktreeSummary {
@@ -291,8 +347,8 @@ impl WorktreeSession {
         while matches!(root_bytes.last(), Some(b'\n' | b'\r')) {
             root_bytes.pop();
         }
-        let raw_root = Path::new(OsStr::from_bytes(&root_bytes));
-        let repo_root = fs::canonicalize(raw_root).map_err(|e| {
+        let raw_root = sys::bytes_to_path_buf(&root_bytes);
+        let repo_root = fs::canonicalize(&raw_root).map_err(|e| {
             format!(
                 "failed to canonicalize git repository root {}: {e}",
                 raw_root.display()
@@ -357,7 +413,8 @@ impl WorktreeSession {
             };
             let mut copied_count = 0usize;
             for entry in untracked_raw.split(|&b| b == 0).filter(|s| !s.is_empty()) {
-                let rel = Path::new(OsStr::from_bytes(entry));
+                let rel_buf = sys::bytes_to_path_buf(entry);
+                let rel = rel_buf.as_path();
                 if rel.components().any(|c| !matches!(c, Component::Normal(_))) {
                     skipped_untracked += 1;
                     continue;
@@ -448,6 +505,7 @@ impl WorktreeSession {
                 baseline_tree,
                 call_id: call_id.to_string(),
                 skipped_untracked,
+                cleaned: false,
             }),
             Err(e) => {
                 cleanup_worktree(&repo_root, &wt_root);
@@ -457,13 +515,14 @@ impl WorktreeSession {
     }
 
     /// Tear down an unused worktree when request preparation fails before spawning the worker.
-    pub fn abort(self) {
+    pub fn abort(mut self) {
+        self.cleaned = true;
         cleanup_worktree(&self.repo_root, &self.wt_root);
     }
 
     /// Export lossless binary/commit-aware unified diff patch vs original baseline tree in O(1) RAM.
     /// If staging, diffing, or writing the patch fails, preserves `wt_root` on disk so zero work is lost.
-    pub fn finalize(self) -> WorktreeSummary {
+    pub fn finalize(mut self) -> WorktreeSummary {
         let export_res = (|| -> Result<(String, Option<PathBuf>), String> {
             run_git(&self.wt_root, &["add", "-A"])?;
             let stat = run_git_capped(
@@ -487,6 +546,7 @@ impl WorktreeSession {
             Ok((stat, patch_path))
         })();
 
+        self.cleaned = true;
         match export_res {
             Ok((diff_stat, patch_path)) => {
                 cleanup_worktree(&self.repo_root, &self.wt_root);
@@ -502,9 +562,18 @@ impl WorktreeSession {
                 diff_stat: String::new(),
                 patch_path: None,
                 export_error: Some(err),
-                preserved_worktree: Some(self.wt_root),
+                preserved_worktree: Some(self.wt_root.clone()),
                 skipped_untracked: self.skipped_untracked,
             },
+        }
+    }
+}
+
+impl Drop for WorktreeSession {
+    fn drop(&mut self) {
+        if !self.cleaned {
+            cleanup_worktree(&self.repo_root, &self.wt_root);
+            self.cleaned = true;
         }
     }
 }
@@ -521,7 +590,7 @@ fn snapshot_tracked_without_touching_index(repo_root: &Path, call_id: &str) -> R
     while matches!(idx_bytes.last(), Some(b'\n' | b'\r')) {
         idx_bytes.pop();
     }
-    let idx_rel = Path::new(OsStr::from_bytes(&idx_bytes));
+    let idx_rel = sys::bytes_to_path_buf(&idx_bytes);
     let src_index = if idx_rel.is_absolute() {
         idx_rel.to_path_buf()
     } else {

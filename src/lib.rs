@@ -1,6 +1,11 @@
 pub mod alloc_cap;
+pub mod debug_cli;
+pub mod metrics;
+pub mod observability;
+pub mod error;
 pub mod harness;
 pub mod mcp_server;
 pub mod protocol;
 pub mod sandbox;
 pub mod stream;
+pub mod swarm;

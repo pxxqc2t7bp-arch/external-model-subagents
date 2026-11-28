@@ -50,7 +50,8 @@ impl HarnessAdapter for ClaudeAdapter {
         let mut args = vec![
             "-p".to_string(),
             "--output-format".into(),
-            "json".into(),
+            "stream-json".into(),
+            "--verbose".into(),
             "--permission-mode".into(),
             perm.into(),
         ];
@@ -189,11 +190,17 @@ impl HarnessAdapter for ClaudeAdapter {
             if let Some(sid) = v.get("session_id").and_then(Value::as_str) {
                 state.session_id = Some(sid.to_string());
             }
+            if let Some(m) = v.get("model").and_then(Value::as_str) {
+                state.used_model = Some(m.to_string());
+            }
             if v.get("is_error").and_then(Value::as_bool) == Some(true) {
                 state.is_error = true;
             }
             if let Some(res) = v.get("result").and_then(Value::as_str) {
                 state.last_message = Some(res.to_string());
+                return;
+            }
+            if v.get("type").is_some() {
                 return;
             }
         }

@@ -54,7 +54,7 @@ pub fn load_from_path(path: &PathBuf) -> Vec<CustomCliAdapter> {
             continue;
         };
         out.push(CustomCliAdapter {
-            id: id.trim().to_ascii_lowercase(),
+            id: super::catalog::canonical_harness_id(id),
             binary_name: bin.trim().to_string(),
             strengths: item
                 .get("strengths")

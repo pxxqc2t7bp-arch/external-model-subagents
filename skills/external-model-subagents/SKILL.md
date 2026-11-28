@@ -1,40 +1,30 @@
 ---
 name: external-model-subagents
-description: Orchestrate external CLI harnesses (Codex, Claude Code, Trae, ZCode, custom CLIs) for debugging, adversarial code review, isolated worktree refactors, and multi-model verification.
+description: Orchestrate external CLI & HTTP harnesses (Codex, Claude Code, Trae, ZCode, DeepSeek, Kimi, Pi, custom) for debugging, Panel/Pipeline/Debate swarms, isolated worktree refactors, and multi-model verification.
 ---
 
-# External Model Harnesses — Master Orchestrator Playbook
+# External Model Harnesses — Master Orchestrator Playbook (v3.0)
 
-Use the `external-model-subagents_hub` MCP server (`dispatch` and `status`) to command external coding harnesses as specialized workers while keeping your own context clean.
+Use the `external-model-subagents_hub` MCP server (`dispatch` and `status`) to command external coding harnesses and multi-model swarms while keeping your own context clean.
 
-## 1. When to Delegate vs. Execute Directly
-- **Do directly yourself**: 1–2 file edits, quick searches, UI/browser checks, or routine workspace commands.
-- **Delegate via `dispatch`**:
-  - **Deep root-cause debugging / adversarial diff review**: `codex` (use `review_base: "uncommitted"` or `"main"`).
-  - **Multi-file module refactoring / isolated implementation**: `claude` or `codex` with `mode: "write"`, `worktree: true` (emits a clean `.patch` you can inspect and `git apply`).
-  - **Multi-model council / cross-verification**: pass `targets: [{harness: "codex", model: "..."}, {harness: "claude", model: "..."}]` (up to 4 concurrent runs).
-  - **Harness-exclusive plugins/IM workflows**: pass `capabilities: "full"` or `mcps: ["<server_name>"]`.
+## 1. Choosing Execution Mode
+- **Direct single run**: `harness: "codex" | "claude" | "trae" | "zcode" | "deepseek" | "kimi" | "pi"`, optional `mode: "write", worktree: true` (emits a clean `git apply`-ready `.patch`).
+- **Parallel `targets`**: Up to 4 independent targets `[{harness, provider, model, effort, prompt}]`.
+- **Structured `swarm`** (pass `swarm: { ... }` on `dispatch`):
+  - **Panel (`type: "panel"`)**: `{type: "panel", consensus_threshold: 0.66, agents: [{harness, model, role, weight}]}` — confidence-weighted `SWARM_VOTE` consensus across specialists.
+  - **Pipeline (`type: "pipeline"`)**: `{type: "pipeline", stages: [{name, harness, model, input_template, output_validation, continue_on_error}]}` — sequential chain with `{task}`, `{prev_output}`, `{context.<stage>}` templates.
+  - **Debate (`type: "debate"`)**: `{type: "debate", rounds: 2, proposer: {...}, challenger: {...}, judge: {...}}` — multi-round adversarial critique and independent verdict.
 
-## 2. Prevent Misrouting: Inspect Inventory First (`status`)
-Users often run official subscriptions alongside custom Model Gateways (LiteLLM, OneAPI, OpenRouter, Bedrock, etc.), and a model alias (e.g. `opus`, `5.4codex`, `sonnet-4.6`) may exist only on specific providers or under gateway-prefixed IDs.
-- Call `status` once per session before routing unfamiliar models or MCPs.
-- Switch providers per call without mutating global configs via `provider` (e.g. `harness: "codex", provider: "openai", model: "gpt-5.4"` vs gateway models).
-- Never guess downgraded versions: the hub enforces version-preserving matching and passes uncached corporate gateway IDs through when `harness` is explicit.
+## 2. Prevent Misrouting & Anti-Bloat Prompting
+- Call `status` (with `include_metrics: true` when diagnosing health) once per session before routing unfamiliar models or gateways.
+- **Anti-over-defensive prompting**: Send **goal + target files + hard constraints (LOC budget, validate once at boundaries, no speculative shims) + verification command**.
+- **Single-proxy gateway note**: If two models share a single-stream local proxy (e.g. `127.0.0.1:8790`), serialize calls via `pipeline` or sequential `handoff_from` rather than simultaneous heavy streams.
 
-## 3. Three Orthogonal Axes (100% Decoupled — Combine Freely)
-1. **`project_rules` (`"smart"` | `"on"` | `"off"`)** — *controls only `AGENTS.md` / `CLAUDE.md`*:
-   - `"on"`: project rules are clean engineering conventions; load 100% natively.
-   - `"smart"` *(default)*: keep repo coding/test conventions, suppress interactive human-prompt / `/plan` / git-push stalls.
-   - `"off"`: repo rules belong to a conflicting framework or hurt the task; skip project rule files completely (`CLAUDE_CODE_DISABLE_CLAUDE_MDS=1` / `project_doc_max_bytes=0`) **without** disabling MCPs or skills.
-   - Always honor explicit user instructions to enable or disable project rules.
-2. **`capabilities` (`"code"` | `"full"`) & `mcps: [...]`** — *controls only external tools/plugins*:
-   - `"code"` *(default)*: built-in tools + zero-cost local Skills, `0` external MCP processes.
-   - `mcps: ["name"]`: dynamically slice config to launch **only** the named MCP server(s).
-   - `"full"`: enable all installed plugins and non-GUI business MCPs.
-3. **`mode` (`"plan"` | `"write"` | `"full"`) & `worktree: true`**:
-   - Default `"plan"` is read-only. Use `worktree: true` for parallel edits or dirty-workspace safety.
+## 3. Three Orthogonal Axes (Combine Freely)
+1. **`project_rules` (`"smart"` | `"on"` | `"off"`)**: Controls only `AGENTS.md` / `CLAUDE.md`.
+2. **`capabilities` (`"code"` | `"full"`) & `mcps: [...]`**: Controls only external MCPs and plugins (`0` child MCPs in `"code"` mode).
+3. **`mode` (`"plan"` | `"write"` | `"full"`) & `worktree: true`**: Read-only default vs isolated dirty-aware Git worktree patch generation.
 
-## 4. Zero-Copy Inter-Agent Relay & Async Background Runs
-- **Briefing rule**: Send **goal + relative file paths + constraints + verification command**—never paste hundreds of lines of source code that the worker can read itself.
-- **Zero-copy handoff**: Every `dispatch` header returns `id=c...`. When chaining Agent A -> Agent B (e.g., implementer -> reviewer), pass `handoff_from: "c..."` plus a 1-sentence instruction so the Rust hub pipes the full artifact locally at **0 Master token copy cost**.
-- **Long async tasks (> 5 min)**: Run `"$HOME/.gemini/config/plugins/external-model-subagents/bin/ext-models-mcp" run --cwd "<dir>" -H <harness> -m <model> - <<'EOF'` via `run_command` in the background (`WaitMsBeforeAsync: 1000`) and wait for native task completion notification.
+## 4. Zero-Copy Handoff & Diagnostics
+- Chain workers at **0 Master token copy cost** via `handoff_from: "c..."`.
+- Inspect or replay runs from CLI via `ext-models-mcp debug <call_id>` and `ext-models-mcp replay <call_id>`.

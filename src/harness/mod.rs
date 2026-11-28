@@ -5,24 +5,30 @@ pub mod catalog;
 pub mod claude;
 pub mod codex;
 pub mod custom;
+pub mod deepseek;
 pub mod discovery;
+pub mod http_client;
+pub mod kimi;
+pub mod pi;
 pub mod trae;
 pub mod zcode;
 
 use crate::alloc_cap::heap_stats_kb;
+use crate::error::record_worker_panic;
 use crate::harness::catalog::{
-    canonical_harness_id, resolve_route, scan_inventories, HarnessInventory,
+    canonical_harness_id, resolve_route_rich, scan_registered_inventories, HarnessInventory,
 };
 use crate::sandbox::{git_diff_stat, run_supervised_bounded, CommandSpec, WorktreeSession};
 use crate::stream::{
     next_call_id, persist_and_budget, read_file_capped, read_handoff, TailBuffer, DEFAULT_MAX_CHARS,
 };
+use crate::swarm::types::SwarmSpec;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -124,6 +130,7 @@ pub struct ParseState {
     pub last_message: Option<String>,
     pub is_error: bool,
     pub raw_tail: TailBuffer,
+    http_reasoning_end: Option<usize>,
 }
 
 impl Default for ParseState {
@@ -140,16 +147,26 @@ impl ParseState {
             last_message: None,
             is_error: false,
             raw_tail: TailBuffer::new(32 * 1024),
+            http_reasoning_end: None,
         }
     }
 }
 
-/// Clean orthogonal adapter contract implemented by each built-in or declarative CLI harness.
+/// Clean orthogonal adapter contract implemented by each built-in or declarative harness.
 pub trait HarnessAdapter: Send + Sync {
     fn id(&self) -> &str;
     fn strengths(&self) -> &str;
     fn is_available(&self) -> bool;
     fn binary_display(&self) -> String;
+
+    fn model_inventory(&self) -> Option<HarnessInventory> {
+        None
+    }
+
+    /// Environment variable to redact from provider output before persisting it.
+    fn response_key_env(&self) -> Option<&str> {
+        None
+    }
 
     /// Build base invocation (`program`, core flags, prompt transport, session/review flags).
     fn build_base(&self, req: &RunRequest) -> Result<CommandSpec, String>;
@@ -184,17 +201,20 @@ pub trait HarnessAdapter: Send + Sync {
     }
 }
 
-static LAST_SESSIONS: OnceLock<Mutex<HashMap<(String, PathBuf), String>>> = OnceLock::new();
+static LAST_SESSIONS: OnceLock<RwLock<HashMap<(String, PathBuf), String>>> = OnceLock::new();
 type InvCacheEntry = Option<(Instant, PathBuf, Arc<BTreeMap<String, HarnessInventory>>)>;
 static INV_CACHE: OnceLock<Mutex<InvCacheEntry>> = OnceLock::new();
 
-fn session_table() -> &'static Mutex<HashMap<(String, PathBuf), String>> {
-    LAST_SESSIONS.get_or_init(|| Mutex::new(HashMap::new()))
+fn session_table() -> &'static RwLock<HashMap<(String, PathBuf), String>> {
+    LAST_SESSIONS.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
 /// Serializes and caches `scan_inventories` briefly (5s) so concurrent `tools/call` bursts
 /// never parse catalog JSON files simultaneously on multiple threads under tight heap caps.
-fn cached_inventories(cwd: &Path) -> Arc<BTreeMap<String, HarnessInventory>> {
+fn cached_inventories(
+    cwd: &Path,
+    adapters: &[Box<dyn HarnessAdapter>],
+) -> Arc<BTreeMap<String, HarnessInventory>> {
     let lock = INV_CACHE.get_or_init(|| Mutex::new(None));
     let mut guard = lock.lock().unwrap_or_else(|e| e.into_inner());
     if let Some((ts, ref cached_cwd, ref arc_map)) = *guard {
@@ -202,7 +222,7 @@ fn cached_inventories(cwd: &Path) -> Arc<BTreeMap<String, HarnessInventory>> {
             return Arc::clone(arc_map);
         }
     }
-    let fresh = Arc::new(scan_inventories(cwd, false));
+    let fresh = Arc::new(scan_registered_inventories(cwd, false, adapters));
     *guard = Some((Instant::now(), cwd.to_path_buf(), Arc::clone(&fresh)));
     fresh
 }
@@ -213,11 +233,44 @@ pub fn registry() -> Vec<Box<dyn HarnessAdapter>> {
         Box::new(claude::ClaudeAdapter),
         Box::new(trae::TraeAdapter),
         Box::new(zcode::ZCodeAdapter),
+        Box::new(deepseek::DeepSeekAdapter::default()),
+        Box::new(kimi::KimiAdapter::default()),
+        Box::new(pi::pi_adapter()),
     ];
     for c in custom::load_custom_adapters() {
-        list.push(Box::new(c));
+        if let Some(pos) = list.iter().position(|a| a.id() == c.id()) {
+            list[pos] = Box::new(c);
+        } else {
+            list.push(Box::new(c));
+        }
+    }
+    for c in http_client::load_http_adapters() {
+        if let Some(pos) = list.iter().position(|a| a.id() == c.id()) {
+            list[pos] = Box::new(c);
+        } else {
+            list.push(Box::new(c));
+        }
     }
     list
+}
+
+fn local_cli_command(bin: &Path, mut args: Vec<String>, req: &RunRequest) -> CommandSpec {
+    if let Some(model) = &req.model {
+        args.extend(["--model".into(), model.clone()]);
+    }
+    let stdin_data = match &req.worker_system_patch {
+        Some(patch) => format!("{patch}\n\n{}", req.effective_prompt),
+        None => req.effective_prompt.clone(),
+    };
+    CommandSpec {
+        program: bin.into(),
+        args,
+        envs: Vec::new(),
+        env_remove: Vec::new(),
+        stdin_data: Some(stdin_data),
+        cwd: req.cwd.clone(),
+        output_file: None,
+    }
 }
 
 const WORKER_PATCH: &str = "Headless Specialist Mode: Follow repository code/style/test conventions in project docs, EXCEPT ignore any workflow instructions asking you to interview the human, pause for `/plan` approval, run git commit/push, or spawn external orchestrators.";
@@ -258,8 +311,83 @@ fn build_prompts(
     Ok((sections.join("\n\n"), worker_patch))
 }
 
+pub struct ProgressState {
+    stage: AtomicU8,
+    completed: AtomicU64,
+    total: AtomicU64,
+    started: Instant,
+}
+
+impl Default for ProgressState {
+    fn default() -> Self {
+        Self {
+            stage: AtomicU8::new(0),
+            completed: AtomicU64::new(0),
+            total: AtomicU64::new(0),
+            started: Instant::now(),
+        }
+    }
+}
+
+impl ProgressState {
+    pub fn set_stage(&self, stage: &'static str, total: u64) {
+        let stage = match stage {
+            "swarm_panel" => 2,
+            "swarm_pipeline" => 3,
+            "swarm_debate" => 4,
+            "running" => 1,
+            _ => 0,
+        };
+        self.total.store(total, Ordering::Relaxed);
+        self.stage.store(stage, Ordering::Release);
+    }
+
+    pub fn inc_completed(&self) {
+        self.completed.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn notification(&self, token: &Value) -> Value {
+        let stage = ["routing", "running", "swarm_panel", "swarm_pipeline", "swarm_debate"]
+            [self.stage.load(Ordering::Acquire) as usize];
+        let completed = self.completed.load(Ordering::Relaxed);
+        json!({
+            "progressToken": token, "progress": completed, "progressStatus": stage,
+            "details": {"stage": stage, "elapsed_ms": self.started.elapsed().as_millis(),
+                "completed": completed, "total": self.total.load(Ordering::Relaxed)}
+        })
+    }
+}
+
 /// Execute a single or multi-target (`targets`) dispatch call and format a compact report.
 pub fn execute_dispatch(args: &Value, cancel: Arc<AtomicBool>) -> (bool, String) {
+    execute_dispatch_with_progress(args, cancel, None)
+}
+
+pub fn execute_dispatch_with_progress(
+    args: &Value,
+    cancel: Arc<AtomicBool>,
+    progress: Option<Arc<ProgressState>>,
+) -> (bool, String) {
+    let started = Instant::now();
+    let timed_out = Arc::new(AtomicBool::new(false));
+    crate::metrics::dispatch_started();
+    crate::observability::event("info", "dispatch_start", || json!({}));
+    let result = dispatch_inner(args, cancel, progress, Arc::clone(&timed_out));
+    let elapsed = started.elapsed();
+    crate::metrics::dispatch_finished(elapsed, result.0, timed_out.load(Ordering::Relaxed));
+    crate::observability::event(if result.0 { "error" } else { "info" }, "dispatch_end", || {
+        json!({"failed": result.0, "duration_ms": elapsed.as_millis(),
+            "timed_out": timed_out.load(Ordering::Relaxed)})
+    });
+    result
+}
+
+fn dispatch_inner(
+    args: &Value,
+    cancel: Arc<AtomicBool>,
+    progress: Option<Arc<ProgressState>>,
+    timed_out: Arc<AtomicBool>,
+) -> (bool, String) {
     let raw_prompt = args.get("prompt").and_then(Value::as_str).unwrap_or("").trim();
     let review_base = args
         .get("review_base")
@@ -332,88 +460,87 @@ pub fn execute_dispatch(args: &Value, cancel: Arc<AtomicBool>) -> (bool, String)
         .unwrap_or(DEFAULT_MAX_CHARS)
         .clamp(800, 40_000);
 
-    let targets = parse_targets(args);
-    if targets.len() > 4 {
-        return (true, "at most 4 parallel `targets` are supported per dispatch.".into());
-    }
-
     let adapters = Arc::new(registry());
     let available: BTreeSet<String> = adapters
         .iter()
         .filter(|a| a.is_available())
         .map(|a| a.id().to_string())
         .collect();
-    let inventories = cached_inventories(&cwd);
+    let inventories = cached_inventories(&cwd, &adapters);
 
+    let env = DispatchEnv {
+        cwd: cwd.clone(),
+        mode,
+        project_rules,
+        capabilities,
+        context_files,
+        review_base,
+        worktree,
+        timeout_ms,
+        idle_timeout_ms,
+        adapters,
+        inventories,
+        available,
+        cancel,
+        progress,
+        timed_out,
+    };
+
+    match SwarmSpec::from_args(args) {
+        Ok(Some(swarm_spec)) => {
+            return crate::swarm::execute_swarm(
+                swarm_spec,
+                raw_prompt,
+                handoff_from,
+                &env,
+                total_max_chars,
+            );
+        }
+        Err(e) => return (true, e.to_string()),
+        Ok(None) => {}
+    }
+
+    let targets = parse_targets(args);
+    if targets.len() > 4 {
+        return (true, "at most 4 parallel `targets` are supported per dispatch.".into());
+    }
+
+    if let Some(progress) = &env.progress {
+        progress.set_stage("routing", targets.len() as u64);
+    }
     let per_target_budget = (total_max_chars / targets.len().max(1)).max(800);
-    let multi = targets.len() > 1;
-
-    if !multi {
-        let t = &targets[0];
-        return run_single_target(
-            t,
+    if targets.len() == 1 {
+        let res = env.run_target(
+            &targets[0],
             raw_prompt,
-            &cwd,
-            mode,
-            project_rules,
-            &capabilities,
             handoff_from,
-            &context_files,
             session_req,
             keep_session,
-            review_base,
-            worktree,
-            timeout_ms,
-            idle_timeout_ms,
             per_target_budget,
-            &adapters,
-            &inventories,
-            &available,
-            cancel,
         );
+        return (res.failed, res.formatted);
     }
 
     // Multi-target parallel execution on compact 256 KiB-stack worker threads.
     let mut handles = Vec::with_capacity(targets.len());
     for t in targets {
+        let env_c = env.clone();
         let prompt_base = raw_prompt.to_string();
-        let cwd_c = cwd.clone();
-        let caps_c = capabilities.clone();
         let hf_c = handoff_from.map(String::from);
-        let cf_c = context_files.clone();
-        let rev_c = review_base.clone();
-        let ad_c = Arc::clone(&adapters);
-        let inv_c = Arc::clone(&inventories);
-        let av_c = available.clone();
-        let can_c = Arc::clone(&cancel);
-        // Forward requested worktree isolation flag to each parallel target worker.
-        let wt_c = worktree;
 
         let handle = thread::Builder::new()
             .name("ext-target".into())
             .stack_size(256 * 1024)
             .spawn(move || {
-                run_single_target(
+                let res = env_c.run_target(
                     &t,
                     &prompt_base,
-                    &cwd_c,
-                    mode,
-                    project_rules,
-                    &caps_c,
                     hf_c.as_deref(),
-                    &cf_c,
                     None,
                     keep_session,
-                    rev_c,
-                    wt_c,
-                    timeout_ms,
-                    idle_timeout_ms,
                     per_target_budget,
-                    &ad_c,
-                    &inv_c,
-                    &av_c,
-                    can_c,
-                )
+                );
+                (res.failed, res.formatted)
             });
         if let Ok(h) = handle {
             handles.push(h);
@@ -430,282 +557,413 @@ pub fn execute_dispatch(args: &Value, cancel: Arc<AtomicBool>) -> (bool, String)
                 }
                 blocks.push(format!("### Target #{}\n{}", idx + 1, txt));
             }
-            Err(_) => blocks.push(format!("### Target #{}\n[worker thread panicked]", idx + 1)),
+            Err(payload) => {
+                let err = record_worker_panic(&format!("target_{}", idx + 1), payload.as_ref());
+                blocks.push(format!("### Target #{}\n{err}", idx + 1));
+            }
         }
     }
     (all_failed, blocks.join("\n\n---\n\n"))
 }
 
-#[allow(clippy::too_many_arguments)]
-fn run_single_target(
-    target: &DispatchTarget,
-    base_prompt: &str,
-    cwd: &Path,
-    mode: WorkMode,
-    project_rules: ProjectRulesMode,
-    capabilities: &CapabilityMode,
-    handoff_from: Option<&str>,
-    context_files: &[String],
-    session_req: Option<String>,
-    keep_session: bool,
-    review_base: Option<String>,
-    worktree: bool,
-    timeout_ms: u64,
-    idle_timeout_ms: u64,
-    budget_chars: usize,
-    adapters: &[Box<dyn HarnessAdapter>],
-    inventories: &BTreeMap<String, HarnessInventory>,
-    available: &BTreeSet<String>,
-    cancel: Arc<AtomicBool>,
-) -> (bool, String) {
-    let route = match resolve_route(
-        target.harness.as_deref(),
-        target.provider.as_deref(),
-        target.model.as_deref(),
-        review_base.is_some(),
-        inventories,
-        available,
-    ) {
-        Ok(r) => r,
-        Err(e) => return (true, format!("Routing error: {e}")),
-    };
+#[derive(Clone)]
+pub struct DispatchEnv {
+    pub cwd: PathBuf,
+    pub mode: WorkMode,
+    pub project_rules: ProjectRulesMode,
+    pub capabilities: CapabilityMode,
+    pub context_files: Vec<String>,
+    pub review_base: Option<String>,
+    pub worktree: bool,
+    pub timeout_ms: u64,
+    pub idle_timeout_ms: u64,
+    pub adapters: Arc<Vec<Box<dyn HarnessAdapter>>>,
+    pub inventories: Arc<BTreeMap<String, HarnessInventory>>,
+    pub available: BTreeSet<String>,
+    pub cancel: Arc<AtomicBool>,
+    pub progress: Option<Arc<ProgressState>>,
+    timed_out: Arc<AtomicBool>,
+}
 
-    let Some(adapter) = adapters.iter().find(|a| a.id() == route.harness) else {
-        return (true, format!("unknown harness '{}'", route.harness));
-    };
+pub struct TargetRunResult {
+    pub call_id: String,
+    pub failed: bool,
+    pub raw_body: String,
+    pub formatted: String,
+}
 
-    if worktree
-        && review_base.as_deref().is_some_and(|b| {
-            b.eq_ignore_ascii_case("uncommitted") || b.eq_ignore_ascii_case("working")
-        })
-    {
-        return (
-            true,
-            "worktree=true cannot be combined with review_base='uncommitted' \
-             (worktree snapshots dirty state into a baseline commit; run read-only uncommitted review without worktree)"
-                .into(),
-        );
-    }
-
-    let call_id = next_call_id();
-    let wt_session = if worktree {
-        match WorktreeSession::create(cwd, &call_id) {
-            Ok(ws) => Some(ws),
-            Err(e) => return (true, format!("Failed to create isolated git worktree: {e}")),
-        }
-    } else {
-        None
-    };
-    let exec_cwd = wt_session
-        .as_ref()
-        .map(|w| w.worktree_cwd.clone())
-        .unwrap_or_else(|| cwd.to_path_buf());
-
-    let prompt_text = target.prompt_override.as_deref().unwrap_or(base_prompt);
-    let (effective_prompt, worker_system_patch) = match build_prompts(
-        prompt_text,
-        mode,
-        project_rules,
-        review_base.is_some(),
-        handoff_from,
-        context_files,
-        &exec_cwd,
-    ) {
-        Ok(pair) => pair,
-        Err(e) => {
-            if let Some(ws) = wt_session {
-                ws.abort();
+impl DispatchEnv {
+    pub fn run_target(
+        &self,
+        target: &DispatchTarget,
+        base_prompt: &str,
+        handoff_from: Option<&str>,
+        session_req: Option<String>,
+        keep_session: bool,
+        budget_chars: usize,
+    ) -> TargetRunResult {
+        let call_id = next_call_id();
+        let mut metadata = json!({
+            "call_id": call_id, "harness": target.harness, "provider": target.provider,
+            "model": target.model, "cwd": self.cwd,
+            "mode": match self.mode { WorkMode::Plan => "plan", WorkMode::Write => "write", WorkMode::Full => "full" },
+            "project_rules": match self.project_rules { ProjectRulesMode::Smart => "smart", ProjectRulesMode::On => "on", ProjectRulesMode::Off => "off" },
+            "prompt": target.prompt_override.as_deref().unwrap_or(base_prompt),
+            "status": "failed", "artifact": null, "patch": null,
+            "effort": target.effort, "review_base": self.review_base, "worktree": self.worktree,
+            "context_files": self.context_files, "handoff_from": handoff_from,
+            "session_id": session_req, "keep_session": keep_session,
+            "timeout_ms": self.timeout_ms, "idle_timeout_ms": self.idle_timeout_ms,
+            "max_chars": budget_chars,
+            "capabilities": if self.capabilities == CapabilityMode::Full { "full" } else { "code" },
+            "mcps": match &self.capabilities { CapabilityMode::Selective(names) => json!(names), _ => json!([]) }
+        });
+        let route = match resolve_route_rich(
+            target.harness.as_deref(),
+            target.provider.as_deref(),
+            target.model.as_deref(),
+            self.review_base.is_some(),
+            &self.inventories,
+            &self.available,
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                crate::observability::event("warn", "routing_failed", || json!({"call_id": call_id}));
+                let msg = format!("Routing error: {e}");
+                metadata["status"] = json!("routing_error");
+                metadata["error"] = json!(msg);
+                crate::debug_cli::save_meta(&call_id, metadata, None);
+                return TargetRunResult {
+                    call_id,
+                    failed: true,
+                    raw_body: msg.clone(),
+                    formatted: msg,
+                };
             }
-            return (true, e);
-        }
-    };
+        };
 
-    let resolved_sid = session_req.and_then(|s| {
-        if s.eq_ignore_ascii_case("last") {
-            session_table()
-                .lock()
-                .ok()
-                .and_then(|m| m.get(&(route.harness.clone(), cwd.to_path_buf())).cloned())
-                .or_else(|| Some("last".into()))
+        let automatic = target.harness.as_deref().is_none_or(|h| h == "auto");
+        crate::metrics::routing(automatic);
+        crate::observability::event("info", "routing_result", || {
+            json!({"call_id": call_id, "harness": route.harness, "automatic": automatic})
+        });
+        metadata["harness"] = json!(route.harness);
+        metadata["provider"] = json!(route.provider);
+        metadata["model"] = json!(route.model);
+        let Some(adapter) = self.adapters.iter().find(|a| a.id() == route.harness) else {
+            let msg = format!("unknown harness '{}'", route.harness);
+            return TargetRunResult {
+                call_id,
+                failed: true,
+                raw_body: msg.clone(),
+                formatted: msg,
+            };
+        };
+
+        if self.worktree
+            && self.review_base.as_deref().is_some_and(|b| {
+                b.eq_ignore_ascii_case("uncommitted") || b.eq_ignore_ascii_case("working")
+            })
+        {
+            let msg = "worktree=true cannot be combined with review_base='uncommitted' \
+                (worktree snapshots dirty state into a baseline commit; run read-only uncommitted review without worktree)"
+                .to_string();
+            return TargetRunResult {
+                call_id,
+                failed: true,
+                raw_body: msg.clone(),
+                formatted: msg,
+            };
+        }
+
+        if let Some(progress) = &self.progress {
+            if progress.stage.load(Ordering::Acquire) == 0 {
+                progress.set_stage("running", progress.total.load(Ordering::Relaxed).max(1));
+            }
+        }
+
+        let wt_session = if self.worktree {
+            match WorktreeSession::create(&self.cwd, &call_id) {
+                Ok(ws) => Some(ws),
+                Err(e) => {
+                    let msg = format!("Failed to create isolated git worktree: {e}");
+                    return TargetRunResult {
+                        call_id,
+                        failed: true,
+                        raw_body: msg.clone(),
+                        formatted: msg,
+                    };
+                }
+            }
         } else {
-            Some(s)
-        }
-    });
+            None
+        };
+        let exec_cwd = wt_session
+            .as_ref()
+            .map(|w| w.worktree_cwd.clone())
+            .unwrap_or_else(|| self.cwd.clone());
 
-    let req = RunRequest {
-        call_id: call_id.clone(),
-        prompt: prompt_text.to_string(),
-        effective_prompt,
-        worker_system_patch,
-        cwd: exec_cwd.clone(),
-        mode,
-        project_rules,
-        capabilities: capabilities.clone(),
-        provider: route.provider.clone(),
-        model: route.model.clone(),
-        effort: target.effort.clone(),
-        session_id: resolved_sid,
-        keep_session,
-        review_base,
-        worktree,
-        timeout_ms,
-        idle_timeout_ms,
-        max_chars: budget_chars,
-    };
-
-    // Orthogonal 4-stage CommandSpec pipeline: base -> headless_guard -> project_rules -> capabilities
-    let mut spec = match adapter.build_base(&req) {
-        Ok(s) => s,
-        Err(e) => {
-            if let Some(ws) = wt_session {
-                ws.abort();
+        let prompt_text = target.prompt_override.as_deref().unwrap_or(base_prompt);
+        let (effective_prompt, worker_system_patch) = match build_prompts(
+            prompt_text,
+            self.mode,
+            self.project_rules,
+            self.review_base.is_some(),
+            handoff_from,
+            &self.context_files,
+            &exec_cwd,
+        ) {
+            Ok(pair) => pair,
+            Err(e) => {
+                if let Some(ws) = wt_session {
+                    ws.abort();
+                }
+                return TargetRunResult {
+                    call_id,
+                    failed: true,
+                    raw_body: e.clone(),
+                    formatted: e,
+                };
             }
-            return (true, e);
-        }
-    };
-    adapter.apply_headless_guard(&mut spec);
-    adapter.apply_project_rules(project_rules, &req, &mut spec);
-    let empty_inv = HarnessInventory::default();
-    let inv = inventories.get(&route.harness).unwrap_or(&empty_inv);
-    adapter.apply_capabilities(capabilities, inv, &exec_cwd, &mut spec);
+        };
 
-    let mut state = ParseState::new();
-    let outcome = match run_supervised_bounded(
-        &spec,
-        Duration::from_millis(timeout_ms),
-        Duration::from_millis(idle_timeout_ms),
-        adapter.max_stdout_line_bytes(),
-        cancel,
-        |line, trunc| adapter.on_stdout_line_bounded(line, trunc, &mut state),
-    ) {
-        Ok(o) => o,
-        Err(e) => {
-            if let Some(ws) = wt_session {
-                ws.abort();
+        let resolved_sid = session_req.and_then(|s| {
+            if s.eq_ignore_ascii_case("last") {
+                session_table()
+                    .read()
+                    .ok()
+                    .and_then(|m| m.get(&(route.harness.clone(), self.cwd.clone())).cloned())
+                    .or_else(|| Some("last".into()))
+            } else {
+                Some(s)
             }
-            return (true, e);
-        }
-    };
+        });
 
-    // Prefer dedicated output file (e.g. Codex `-o <file>`) if written and non-empty.
-    let file_msg = spec
-        .output_file
-        .as_ref()
-        .and_then(|p| {
-            let txt = read_file_capped(p, 2 * 1024 * 1024).ok();
-            let _ = fs::remove_file(p);
-            txt
-        })
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
+        let req = RunRequest {
+            call_id: call_id.clone(),
+            prompt: prompt_text.to_string(),
+            effective_prompt,
+            worker_system_patch,
+            cwd: exec_cwd.clone(),
+            mode: self.mode,
+            project_rules: self.project_rules,
+            capabilities: self.capabilities.clone(),
+            provider: route.provider.clone(),
+            model: route.model.clone(),
+            effort: target.effort.clone(),
+            session_id: resolved_sid,
+            keep_session,
+            review_base: self.review_base.clone(),
+            worktree: self.worktree,
+            timeout_ms: self.timeout_ms,
+            idle_timeout_ms: self.idle_timeout_ms,
+            max_chars: budget_chars,
+        };
 
-    let raw_reply = file_msg
-        .or_else(|| state.last_message.take())
-        .unwrap_or_else(|| state.raw_tail.as_str().to_string());
+        // Orthogonal 4-stage CommandSpec pipeline: base -> headless_guard -> project_rules -> capabilities
+        let mut spec = match adapter.build_base(&req) {
+            Ok(s) => s,
+            Err(e) => {
+                if let Some(ws) = wt_session {
+                    ws.abort();
+                }
+                return TargetRunResult {
+                    call_id,
+                    failed: true,
+                    raw_body: e.clone(),
+                    formatted: e,
+                };
+            }
+        };
+        adapter.apply_headless_guard(&mut spec);
+        adapter.apply_project_rules(self.project_rules, &req, &mut spec);
+        let empty_inv = HarnessInventory::default();
+        let inv = self.inventories.get(&route.harness).unwrap_or(&empty_inv);
+        adapter.apply_capabilities(&self.capabilities, inv, &exec_cwd, &mut spec);
 
-    let wt_summary = wt_session.map(|ws| ws.finalize());
-    let direct_diff = if wt_summary.is_none() && mode != WorkMode::Plan {
-        git_diff_stat(&exec_cwd)
-    } else {
-        None
-    };
+        let mut state = ParseState::new();
+        let mut outcome = match run_supervised_bounded(
+            &spec,
+            Duration::from_millis(self.timeout_ms),
+            Duration::from_millis(self.idle_timeout_ms),
+            adapter.max_stdout_line_bytes(),
+            Arc::clone(&self.cancel),
+            |line, trunc| adapter.on_stdout_line_bounded(line, trunc, &mut state),
+        ) {
+            Ok(o) => o,
+            Err(e) => {
+                if let Some(ws) = wt_session {
+                    ws.abort();
+                }
+                return TargetRunResult {
+                    call_id,
+                    failed: true,
+                    raw_body: e.clone(),
+                    formatted: e,
+                };
+            }
+        };
 
-    let export_failed = wt_summary
-        .as_ref()
-        .is_some_and(|w| w.export_error.is_some());
-    let failed = outcome.cancelled
-        || outcome.timed_out
-        || outcome.idle_timed_out
-        || state.is_error
-        || outcome.exit_code != 0
-        || export_failed;
+        // Prefer dedicated output file (e.g. Codex `-o <file>`) if written and non-empty.
+        let file_msg = spec
+            .output_file
+            .as_ref()
+            .and_then(|p| {
+                let txt = read_file_capped(p, 2 * 1024 * 1024).ok();
+                let _ = fs::remove_file(p);
+                txt
+            })
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
 
-    if keep_session && !failed {
-        if let Some(ref sid) = state.session_id {
-            if let Ok(mut tbl) = session_table().lock() {
-                tbl.insert((route.harness.clone(), cwd.to_path_buf()), sid.clone());
+        let mut raw_reply = file_msg
+            .or_else(|| state.last_message.take())
+            .unwrap_or_else(|| state.raw_tail.as_str().to_string());
+        if let Some(key) = adapter
+            .response_key_env()
+            .and_then(|name| std::env::var(name).ok())
+            .filter(|key| !key.is_empty())
+        {
+            for output in [&mut raw_reply, &mut outcome.stderr_tail] {
+                if output.contains(key.as_str()) {
+                    *output = output.replace(key.as_str(), "[redacted]");
+                }
             }
         }
-    }
 
-    let mut full_body = if raw_reply.trim().is_empty() {
-        if failed {
+        let wt_summary = wt_session.map(|ws| ws.finalize());
+        let direct_diff = if wt_summary.is_none() && self.mode != WorkMode::Plan {
+            git_diff_stat(&exec_cwd)
+        } else {
+            None
+        };
+
+        let export_failed = wt_summary
+            .as_ref()
+            .is_some_and(|w| w.export_error.is_some());
+        let failed = outcome.cancelled
+            || outcome.timed_out
+            || outcome.idle_timed_out
+            || state.is_error
+            || outcome.exit_code != 0
+            || export_failed;
+
+        if keep_session && !failed {
+            if let Some(ref sid) = state.session_id {
+                if let Ok(mut tbl) = session_table().write() {
+                    tbl.insert((route.harness.clone(), self.cwd.clone()), sid.clone());
+                }
+            }
+        }
+
+        let no_stdout = raw_reply.trim().is_empty();
+        let mut full_body = if failed && no_stdout {
             format!("(no stdout; stderr: {})", outcome.stderr_tail)
         } else {
-            "(completed with empty stdout)".to_string()
+            raw_reply
+        };
+
+        if failed && !outcome.stderr_tail.is_empty() && !full_body.contains(&outcome.stderr_tail) {
+            full_body.push_str("\n\n[stderr tail]\n");
+            full_body.push_str(&outcome.stderr_tail);
         }
-    } else {
-        raw_reply
-    };
 
-    if failed && !outcome.stderr_tail.is_empty() && !full_body.contains(&outcome.stderr_tail) {
-        full_body.push_str("\n\n[stderr tail]\n");
-        full_body.push_str(&outcome.stderr_tail);
-    }
-
-    let (budgeted_body, saved_path) =
-        persist_and_budget(&call_id, &route.harness, &full_body, budget_chars);
-
-    let mut meta = vec![format!("id={call_id}"), format!("harness={}", route.harness)];
-    if let Some(ref p) = route.provider {
-        meta.push(format!("provider={p}"));
-    }
-    if let Some(m) = state.used_model.or(route.model) {
-        meta.push(format!("model={m}"));
-    }
-    if let Some(sid) = state.session_id {
-        meta.push(format!("session_id={sid}"));
-    }
-    meta.push(format!("{}ms", outcome.duration_ms));
-    if outcome.cancelled {
-        meta.push("status=cancelled".into());
-    } else if outcome.timed_out {
-        meta.push("status=timeout".into());
-    } else if outcome.idle_timed_out {
-        meta.push("status=idle_timeout".into());
-    } else if failed {
-        meta.push(format!("exit={}", outcome.exit_code));
-    }
-    if let Some(ref p) = saved_path {
-        meta.push(format!("artifact={}", p.display()));
-    }
-
-    let mut out = format!("[{}]\n", meta.join(" | "));
-    if let Some(note) = route.note {
-        out.push_str(&format!("[route: {note}]\n"));
-    }
-    out.push('\n');
-    out.push_str(&budgeted_body);
-
-    if let Some(wt) = wt_summary {
-        if wt.skipped_untracked > 0 {
-            out.push_str(&format!(
-                "\n\n[worktree note: skipped {} untracked item(s) (symlinks, >2 MiB, or >50 file cap)]",
-                wt.skipped_untracked
-            ));
-        }
-        if let Some(err) = wt.export_error {
-            let kept = wt
-                .preserved_worktree
-                .map(|p| format!("; checkout preserved at {}", p.display()))
-                .unwrap_or_default();
-            out.push_str(&format!("\n\n[worktree export error: {err}{kept}]"));
+        let display_body = if !failed && no_stdout {
+            "(completed with empty stdout)"
         } else {
-            if !wt.diff_stat.is_empty() {
-                out.push_str(&format!("\n\n[worktree diff]\n{}", wt.diff_stat));
-            }
-            if let Some(pp) = wt.patch_path {
+            &full_body
+        };
+        let (budgeted_body, saved_path) =
+            persist_and_budget(&call_id, &route.harness, display_body, budget_chars);
+
+        if outcome.timed_out || outcome.idle_timed_out {
+            self.timed_out.store(true, Ordering::Relaxed);
+        }
+
+        let mut meta = vec![format!("id={call_id}"), format!("harness={}", route.harness)];
+        if let Some(ref p) = route.provider {
+            meta.push(format!("provider={p}"));
+        }
+        if let Some(m) = state.used_model.or(route.model) {
+            metadata["model"] = json!(m);
+            meta.push(format!("model={m}"));
+        }
+        if let Some(sid) = state.session_id {
+            meta.push(format!("session_id={sid}"));
+        }
+        meta.push(format!("{}ms", outcome.duration_ms));
+        let status_label = if outcome.cancelled {
+            meta.push("status=cancelled".into());
+            "cancelled"
+        } else if outcome.timed_out {
+            meta.push("status=timeout".into());
+            "timeout"
+        } else if outcome.idle_timed_out {
+            meta.push("status=idle_timeout".into());
+            "idle_timeout"
+        } else if failed {
+            meta.push(format!("exit={}", outcome.exit_code));
+            "failed"
+        } else {
+            "success"
+        };
+        if let Some(ref p) = saved_path {
+            meta.push(format!("artifact={}", p.display()));
+            metadata["artifact"] = json!(p);
+        }
+        metadata["duration_ms"] = json!(outcome.duration_ms);
+        metadata["exit_code"] = json!(outcome.exit_code);
+        metadata["failed"] = json!(failed);
+        metadata["status"] = json!(status_label);
+
+        let mut out = format!("[{}]\n", meta.join(" | "));
+        if let Some(note) = route.note {
+            out.push_str(&format!("[route: {note}]\n"));
+        }
+        out.push('\n');
+        out.push_str(&budgeted_body);
+
+        if let Some(wt) = wt_summary {
+            if wt.skipped_untracked > 0 {
                 out.push_str(&format!(
-                    "\n[patch ready: `git apply {}`]",
-                    pp.display()
+                    "\n\n[worktree note: skipped {} untracked item(s) (symlinks, >2 MiB, or >50 file cap)]",
+                    wt.skipped_untracked
                 ));
             }
+            if let Some(err) = wt.export_error {
+                let kept = wt
+                    .preserved_worktree
+                    .map(|p| format!("; checkout preserved at {}", p.display()))
+                    .unwrap_or_default();
+                out.push_str(&format!("\n\n[worktree export error: {err}{kept}]"));
+            } else {
+                if !wt.diff_stat.is_empty() {
+                    out.push_str(&format!("\n\n[worktree diff]\n{}", wt.diff_stat));
+                }
+                if let Some(pp) = wt.patch_path {
+                    metadata["patch"] = json!(pp);
+                    out.push_str(&format!(
+                        "\n[patch ready: `git apply {}`]",
+                        pp.display()
+                    ));
+                }
+            }
+        } else if let Some(st) = direct_diff {
+            out.push_str(&format!("\n\n[workspace git status]\n{st}"));
         }
-    } else if let Some(st) = direct_diff {
-        out.push_str(&format!("\n\n[workspace git status]\n{st}"));
-    }
 
-    (failed, out)
+        crate::debug_cli::save_meta(&call_id, metadata, adapter.response_key_env());
+        if let Some(progress) = &self.progress {
+            progress.inc_completed();
+        }
+
+        TargetRunResult {
+            call_id,
+            failed,
+            raw_body: full_body,
+            formatted: out,
+        }
+    }
 }
 
 fn parse_targets(args: &Value) -> Vec<DispatchTarget> {
@@ -737,8 +995,17 @@ fn parse_targets(args: &Value) -> Vec<DispatchTarget> {
 
 /// Build the `status` JSON report (capabilities, models, providers, and live Rust heap stats).
 pub fn build_status_report(cwd: &Path, probe_models: bool) -> String {
+    build_status_report_with_options(cwd, probe_models, false)
+}
+
+/// Build the `status` JSON report with optional cumulative process metrics.
+pub fn build_status_report_with_options(
+    cwd: &Path,
+    probe_models: bool,
+    include_metrics: bool,
+) -> String {
     let adapters = registry();
-    let inventories = scan_inventories(cwd, probe_models);
+    let inventories = scan_registered_inventories(cwd, probe_models, &adapters);
     let (cur_kb, peak_kb, limit_kb) = heap_stats_kb();
 
     let mut harnesses_json = Vec::with_capacity(adapters.len());
@@ -758,7 +1025,7 @@ pub fn build_status_report(cwd: &Path, probe_models: bool) -> String {
         }));
     }
 
-    let report = json!({
+    let mut report = json!({
         "hub_version": env!("CARGO_PKG_VERSION"),
         "heap_kb": {
             "current": cur_kb,
@@ -767,5 +1034,8 @@ pub fn build_status_report(cwd: &Path, probe_models: bool) -> String {
         },
         "harnesses": harnesses_json,
     });
+    if include_metrics {
+        report["metrics"] = crate::metrics::snapshot();
+    }
     serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".into())
 }

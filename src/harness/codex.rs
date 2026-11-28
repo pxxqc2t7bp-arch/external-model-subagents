@@ -58,10 +58,6 @@ impl HarnessAdapter for CodexAdapter {
         if let Some(ref prov) = req.provider {
             let escaped = escape_toml_str(prov);
             args.extend(["-c".into(), format!("model_provider=\"{escaped}\"")]);
-            // When explicitly switching to official OpenAI subscription, clear custom catalog override.
-            if prov.eq_ignore_ascii_case("openai") {
-                args.extend(["-c".into(), "model_catalog_json=\"\"".into()]);
-            }
         }
         if let Some(ref m) = req.model {
             args.extend(["-m".into(), m.clone()]);
@@ -188,7 +184,20 @@ impl HarnessAdapter for CodexAdapter {
     ) {
         match caps {
             CapabilityMode::Code => {
-                insert_before_subcmd(&mut spec.args, &["-c", "mcp_servers={}"]);
+                // Disable both `[mcp_servers]` and `[plugins.*]` remote OAuth MCP workers in headless code runs.
+                let mut flags = vec!["-c".to_string(), "mcp_servers={}".to_string()];
+                if inv.plugins.is_empty() {
+                    flags.push("-c".into());
+                    flags.push("plugins={}".into());
+                } else {
+                    for plug in &inv.plugins {
+                        let escaped = escape_toml_str(plug);
+                        flags.push("-c".into());
+                        flags.push(format!("plugins.\"{escaped}\".enabled=false"));
+                    }
+                }
+                let refs: Vec<&str> = flags.iter().map(String::as_str).collect();
+                insert_before_subcmd(&mut spec.args, &refs);
             }
             CapabilityMode::Selective(allowed) => {
                 let mut flags = Vec::new();
@@ -196,6 +205,13 @@ impl HarnessAdapter for CodexAdapter {
                     if !allowed.iter().any(|a| a.eq_ignore_ascii_case(name)) {
                         flags.push("-c".to_string());
                         flags.push(format!("mcp_servers.{name}.enabled=false"));
+                    }
+                }
+                for plug in &inv.plugins {
+                    if !allowed.iter().any(|a| a.eq_ignore_ascii_case(plug)) {
+                        let escaped = escape_toml_str(plug);
+                        flags.push("-c".into());
+                        flags.push(format!("plugins.\"{escaped}\".enabled=false"));
                     }
                 }
                 let refs: Vec<&str> = flags.iter().map(String::as_str).collect();

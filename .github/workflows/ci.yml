@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  unix-test:
+    name: Test & Clippy (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - name: Clippy (zero warnings)
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Integration & unit tests
+        run: cargo test
+      - name: Release binary size gate (< 1 MiB)
+        run: |
+          cargo build --release
+          size=$(wc -c < target/release/ext-models-mcp)
+          echo "Release binary bytes: $size"
+          test "$size" -lt 1048576
+
+  windows-check:
+    name: Windows Compile & Smoke Test
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Clippy & compile all targets on Windows
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Build release binary on Windows
+        run: cargo build --release

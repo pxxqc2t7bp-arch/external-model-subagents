@@ -1,22 +1,23 @@
-# External Model Subagents (v2.0 — Rust Heap-Bounded Master–Harness Hub)
+# External Model Subagents (v3.0 — Heap-Bounded Rust Swarm & Harness Hub)
 
-Ultra-lightweight native **Rust MCP Server & CLI Hub** for orchestrating external AI coding harnesses (**OpenAI Codex**, **Claude Code**, **Trae**, **ZCode**, plus declarative custom CLIs like **OpenCode** or **Aider**) from a Master Orchestrator such as Antigravity.
+Ultra-lightweight native **pure-`std` Rust MCP Server & CLI Hub** (`~650 KB` binary, `~2 MB` idle RSS, `0.0%` idle CPU) for orchestrating external AI coding CLIs (**OpenAI Codex**, **Claude Code**, **Trae**, **ZCode**, **DeepSeek**, **Kimi**, plus custom CLIs) and zero-exposure **HTTP SSE harnesses** (**Pi**, **OpenRouter**, custom gateways) from Antigravity.
 
-## Key Design Highlights
+## Key Capabilities in v3.0
 
-- **Tiny Runtime Footprint**: Replaces multiple idle Node.js MCP servers (`~58 MB` RSS) with **1 native pure-`std` Rust binary** (`~500 KB` binary, `~2 MB` idle RSS, `0.0%` idle CPU) guarded by a `#[global_allocator]` hard heap ceiling (`EXT_MODELS_MAX_HEAP_MB=16`) and structurally bounded `64 KiB` streaming line buffers.
-- **Minimal Passive Context (~76% Fewer Tokens/Turn)**: Exposes just 2 unified MCP tools (`dispatch`, `status`) with zero redundant background subagent definitions.
-- **Provider-Aware & Subscription/Gateway Safe Routing**:
-  - Cleanly separates **Official Subscriptions (OAuth)** from **Custom Model Gateways** (LiteLLM, OneAPI, OpenRouter, Bedrock, Vertex, corporate hubs) per `(harness, provider)`.
-  - Supports per-call `provider` switching (e.g., `provider: "openai"` vs `provider: "litellm"`) without editing global `~/.codex/config.toml`.
-  - Enforces **version-preserving normalization** (e.g., `5.4codex` resolves to `gpt-5.4-codex` or gateway-prefixed equivalents, while refusing silent version downgrades like `5.4 -> 5.2`).
+- **Structured Multi-Model Swarm Modes (`swarm`)**:
+  - **`panel`**: Parallel multi-model review/analysis with confidence-weighted `SWARM_VOTE` consensus and partial-failure tolerance.
+  - **`pipeline`**: Multi-stage sequential workflows (`analyze -> refine -> verify`) with single-pass template variables (`{task}`, `{prev_output}`, `{context.<stage>}`) and output validation (`non_empty`, `json_valid`, `contains`, `min_chars`).
+  - **`debate`**: Multi-round `proposer` vs `challenger` adversarial critique judged by an independent `judge` model.
+- **Expanded CLI + Zero-Leakage HTTP Ecosystem**:
+  - Built-in adapters for `codex`, `claude`, `trae`, `zcode`, `deepseek` (CLI + R1 reasoning HTTP fallback), `kimi` (CLI + Moonshot HTTP fallback), and `pi` (HTTP SSE).
+  - Declarative `harnesses.json` (custom CLIs) and `http-harnesses.json` (`openai_sse` / `anthropic_sse` via `curl -K -` stdin config — zero API keys in process `argv` or child env).
 - **Three 100% Orthogonal Control Axes**:
-  1. **Headless Guard (always active)**: Strips GUI popups, TTY-blocking hooks, and self-recursive MCP loops (`A -> B -> A`).
-  2. **`project_rules` (`smart` | `on` | `off`)**: Controls `AGENTS.md` / `CLAUDE.md` loading (`CLAUDE_CODE_DISABLE_CLAUDE_MDS=1` / `project_doc_max_bytes=0`) with **zero coupling** to MCPs, plugins, or skills.
-  3. **`capabilities` (`code` | `full`) & `mcps: [...]`**: Keep default runs instant (`0` child MCPs while preserving zero-cost local Skills), mount only named MCP servers via dynamic config slicing, or unlock full plugin ecosystems on demand.
-- **Zero-Copy Inter-Agent Handoff & Dirty-Aware Git Worktrees**:
-  - `handoff_from: "<call_id>"` pipes Agent A's full output directly into Agent B's stdin inside Rust—zero Master token copy tax.
-  - `worktree: true` snapshots uncommitted tracked & untracked changes into an isolated temporary Git worktree and exports a clean `.patch` (`git apply <patch>`).
+  1. **Headless Guard**: Strips GUI popups, TTY hooks, remote OAuth plugin MCP stalls, and recursive MCP loops.
+  2. **`project_rules` (`smart` | `on` | `off`)**: Controls `AGENTS.md` / `CLAUDE.md` independently of MCPs and skills.
+  3. **`capabilities` (`code` | `full`) & `mcps: [...]`**: Instant zero-MCP default, selective MCP slicing, or full plugin access.
+- **Observability, Metrics & Time-Travel Debugging**:
+  - `ext-models-mcp status --metrics` (or MCP `status` with `include_metrics: true`) reports `AtomicU64` dispatch/swarm counters, 5-bucket latency histograms, and live `#[global_allocator]` heap stats.
+  - `ext-models-mcp debug <call_id>` & `ext-models-mcp replay <call_id>` inspect timelines/artifacts and safely replay calls.
 
 ## Quick Install
 
@@ -24,21 +25,38 @@ Ultra-lightweight native **Rust MCP Server & CLI Hub** for orchestrating externa
 ./scripts/install.sh
 ```
 
-Requires Rust (`cargo`, edition 2021) on macOS or Linux. No hardcoded paths—works out of the box across `$HOME`, Mise, NVM, FNM, Volta, and Homebrew installations.
+## Quick Examples
 
-## Extending Without Recompiling
+```bash
+# 1. Inspect installed harnesses, models, heap stats, and cumulative metrics
+ext-models-mcp status --metrics
 
-- **Add Custom CLI Harnesses**: Copy `harnesses.example.json` to `~/.gemini/config/plugins/external-model-subagents/harnesses.json`.
-- **Declare Uncached Gateway Models**: Copy `models.example.json` to `~/.gemini/config/plugins/external-model-subagents/models.json`.
+# 2. Run a 3-agent Panel Swarm with weighted consensus
+ext-models-mcp run --swarm '{"type":"panel","consensus_threshold":0.66,"agents":[{"harness":"codex","role":"security"},{"harness":"claude","role":"architecture"},{"harness":"deepseek","role":"reasoning"}]}' "Audit src/sandbox.rs for race conditions"
+
+# 3. Inspect or replay a previous call
+ext-models-mcp debug c12345_1
+ext-models-mcp replay c12345_1
+```
 
 ## Environment Variables
 
 | Variable | Default | Purpose |
 | :--- | :--- | :--- |
 | `EXT_MODELS_MAX_HEAP_MB` | `16` | Hard heap ceiling in MiB (`4..=256`) |
-| `EXT_MODELS_MAX_JOBS` | `3` | Max concurrent external CLI processes (`1..=8`) |
+| `EXT_MODELS_MAX_JOBS` | `3` | Max concurrent child CLI/HTTP processes (`1..=12`) |
+| `EXT_MODELS_ARTIFACT_TTL_DAYS` | `7` | Auto-clean expired `/tmp/ext-models` artifacts (`0` = disable) |
 | `EXT_MODELS_DEFAULT_RULES` | `smart` | Default `project_rules` policy (`smart` \| `on` \| `off`) |
 | `EXT_MODELS_DEFAULT_CAPS` | `code` | Default `capabilities` profile (`code` \| `full`) |
+| `EXT_MODELS_LOG_FILE` | *(unset)* | Opt-in path for structured event logs |
+| `EXT_MODELS_LOG_LEVEL` | `info` | Log verbosity (`error` \| `warn` \| `info` \| `debug`) |
+| `EXT_MODELS_LOG_FORMAT` | `human` | Log encoding (`human` \| `json`) |
+
+## Documentation
+- [Architecture Guide](./ARCHITECTURE.md)
+- [Engineering & Anti-Bloat Contract](./AGENTS.md)
+- [Contributing](./CONTRIBUTING.md)
+- [Changelog](./CHANGELOG.md)
 
 ## License
 

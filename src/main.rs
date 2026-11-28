@@ -4,7 +4,8 @@
 //! - `ext-models-mcp run ...`       : Direct headless CLI runner (ideal for async background jobs)
 
 use ext_models_mcp::alloc_cap;
-use ext_models_mcp::harness::{build_status_report, execute_dispatch};
+use ext_models_mcp::debug_cli;
+use ext_models_mcp::harness::{build_status_report_with_options, execute_dispatch};
 use ext_models_mcp::mcp_server::serve_stdio;
 use serde_json::{json, Map, Value};
 use std::env;
@@ -16,12 +17,14 @@ use std::sync::Arc;
 
 fn main() {
     alloc_cap::init_from_env();
+    ext_models_mcp::metrics::init();
     let args: Vec<String> = env::args().skip(1).collect();
 
     let code = match args.first().map(String::as_str) {
         None | Some("mcp") => serve_stdio(),
         Some("status") => cmd_status(&args[1..]),
         Some("run") => cmd_run(&args[1..]),
+        Some(cmd @ ("debug" | "trace" | "replay")) => cmd_debug_or_replay(cmd, &args[1..]),
         Some("-h") | Some("--help") | Some("help") => {
             print_help();
             0
@@ -38,13 +41,25 @@ fn main() {
     process::exit(code);
 }
 
+fn cmd_debug_or_replay(cmd: &str, args: &[String]) -> i32 {
+    let Some(call_id) = args.first() else {
+        eprintln!("Usage: ext-models-mcp {cmd} <call_id>");
+        return 2;
+    };
+    let (is_err, out) = debug_cli::run(cmd, call_id);
+    println!("{out}");
+    if is_err { 1 } else { 0 }
+}
+
 fn cmd_status(args: &[String]) -> i32 {
     let mut probe = false;
+    let mut metrics = false;
     let mut cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
             "--probe" | "--models" => probe = true,
+            "--metrics" => metrics = true,
             "--cwd" if i + 1 < args.len() => {
                 cwd = PathBuf::from(&args[i + 1]);
                 i += 1;
@@ -53,7 +68,7 @@ fn cmd_status(args: &[String]) -> i32 {
         }
         i += 1;
     }
-    println!("{}", build_status_report(&cwd, probe));
+    println!("{}", build_status_report_with_options(&cwd, probe, metrics));
     0
 }
 
@@ -126,6 +141,30 @@ fn cmd_run(args: &[String]) -> i32 {
             "--worktree" | "-w" => {
                 obj.insert("worktree".into(), json!(true));
             }
+            "--swarm" if next.is_some() => {
+                let raw = next.unwrap();
+                let content = if raw.trim_start().starts_with('{') {
+                    raw.clone()
+                } else {
+                    match std::fs::read_to_string(raw) {
+                        Ok(txt) => txt,
+                        Err(e) => {
+                            eprintln!("Failed to read --swarm file '{raw}': {e}");
+                            return 2;
+                        }
+                    }
+                };
+                match serde_json::from_str::<Value>(&content) {
+                    Ok(v) => {
+                        obj.insert("swarm".into(), v);
+                    }
+                    Err(e) => {
+                        eprintln!("Invalid --swarm JSON: {e}");
+                        return 2;
+                    }
+                }
+                i += 1;
+            }
             "--timeout-ms" if next.is_some() => {
                 if let Ok(n) = next.unwrap().parse::<u64>() {
                     obj.insert("timeout_ms".into(), json!(n));
@@ -178,9 +217,10 @@ fn print_help() {
     println!(
         "ext-models-mcp {} — Heap-bounded Rust MCP hub for external CLI coding harnesses\n\n\
          USAGE:\n  \
-           ext-models-mcp [mcp]                       Start stdio MCP server\n  \
-           ext-models-mcp status [--probe] [--cwd D]  Inspect harnesses, providers, models & heap\n  \
-           ext-models-mcp run [OPTIONS] [PROMPT|-]    Run a task directly (reads stdin if '-')\n\n\
+           ext-models-mcp [mcp]                                  Start stdio MCP server\n  \
+           ext-models-mcp status [--probe] [--metrics] [--cwd D] Inspect harnesses, models, metrics & heap\n  \
+           ext-models-mcp run [OPTIONS] [PROMPT|-]               Run a task directly (reads stdin if '-')\n  \
+           ext-models-mcp debug|trace|replay <call_id>           Inspect or replay a previous dispatch\n\n\
          RUN OPTIONS:\n  \
            -H, --harness <codex|claude|trae|zcode|auto>\n  \
            -P, --provider <id>       Provider override (e.g. 'openai' vs 'litellm')\n  \
@@ -191,6 +231,7 @@ fn print_help() {
            --caps <code|full>        External capability profile (default: code)\n  \
            --mcp <name>              Mount specific MCP server (repeatable)\n  \
            -w, --worktree            Execute inside isolated dirty-aware git worktree\n  \
+           --swarm <json|file>       Execute structured Swarm ('panel'|'pipeline'|'debate')\n  \
            --review <base|uncommitted>\n  \
            --handoff <call_id>       Zero-copy pipe previous call artifact\n  \
            --session <id|last>       Resume session\n  \

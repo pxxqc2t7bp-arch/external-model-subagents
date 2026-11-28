@@ -1,17 +1,110 @@
 //! Structurally bounded, UTF-8 safe line reader, ring tail buffer, and zero-copy handoff store.
 
-use std::fs::{self, OpenOptions};
+use std::fs;
 use std::io::{self, BufRead, Read, Write};
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
+use std::time::{Duration, SystemTime};
 
 /// Maximum bytes retained per single stdout line (prevents OOM on multi-MB JSONL tool dumps).
 pub const MAX_LINE_BYTES: usize = 64 * 1024;
 /// Default character budget returned inline to the Master Orchestrator.
 pub const DEFAULT_MAX_CHARS: usize = 8_000;
+const DEFAULT_ARTIFACT_TTL_DAYS: u64 = 7;
 
 static CALL_SEQ: AtomicU64 = AtomicU64::new(1);
+static TTL_SWEEP_ONCE: OnceLock<()> = OnceLock::new();
+
+#[cfg(unix)]
+mod sys {
+    use std::fs;
+    use std::io;
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+    use std::path::Path;
+
+    pub fn ensure_secure_dir(base: &Path) -> io::Result<()> {
+        match fs::symlink_metadata(base) {
+            Ok(meta) => {
+                if meta.file_type().is_symlink() || !meta.file_type().is_dir() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        format!("artifact path {} is not a real directory", base.display()),
+                    ));
+                }
+                let uid = unsafe { libc::geteuid() };
+                if meta.uid() != uid {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        format!(
+                            "artifact directory {} is not owned by current user",
+                            base.display()
+                        ),
+                    ));
+                }
+                if meta.permissions().mode() & 0o777 != 0o700 {
+                    let _ = fs::set_permissions(base, fs::Permissions::from_mode(0o700));
+                }
+                Ok(())
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                let mut builder = fs::DirBuilder::new();
+                builder.recursive(true).mode(0o700);
+                builder.create(base)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    pub fn open_secure_writer(path: &Path) -> io::Result<fs::File> {
+        fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)
+    }
+}
+
+#[cfg(not(unix))]
+mod sys {
+    use std::fs;
+    use std::io;
+    use std::path::Path;
+
+    pub fn ensure_secure_dir(base: &Path) -> io::Result<()> {
+        match fs::symlink_metadata(base) {
+            Ok(meta) => {
+                if meta.file_type().is_symlink() || !meta.file_type().is_dir() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        format!("artifact path {} is not a real directory", base.display()),
+                    ));
+                }
+                Ok(())
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => fs::create_dir_all(base),
+            Err(e) => Err(e),
+        }
+    }
+
+    pub fn open_secure_writer(path: &Path) -> io::Result<fs::File> {
+        if let Ok(meta) = fs::symlink_metadata(path) {
+            if meta.file_type().is_symlink() {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "refusing to write through symlink",
+                ));
+            }
+        }
+        fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(path)
+    }
+}
 
 /// Generate a short deterministic call ID (`c<pid>_<seq>`) for zero-copy handoff files.
 pub fn next_call_id() -> String {
@@ -19,49 +112,62 @@ pub fn next_call_id() -> String {
     format!("c{}_{}", std::process::id(), seq)
 }
 
-/// Ensure `/tmp/ext-models` exists as a non-symlink directory owned by the current UID (`0o700`).
+/// Ensure `<temp_dir>/ext-models` exists as an owner-only non-symlink directory and run lazy TTL sweep once.
 pub fn artifact_dir() -> io::Result<PathBuf> {
     let base = std::env::temp_dir().join("ext-models");
-    match fs::symlink_metadata(&base) {
-        Ok(meta) => {
-            if meta.file_type().is_symlink() || !meta.file_type().is_dir() {
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    format!("artifact path {} is not a real directory", base.display()),
-                ));
-            }
-            let uid = unsafe { libc::geteuid() };
-            if meta.uid() != uid {
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    format!("artifact directory {} is not owned by current user", base.display()),
-                ));
-            }
-            if meta.permissions().mode() & 0o777 != 0o700 {
-                let _ = fs::set_permissions(&base, fs::Permissions::from_mode(0o700));
-            }
+    sys::ensure_secure_dir(&base)?;
+    TTL_SWEEP_ONCE.get_or_init(|| {
+        let days = std::env::var("EXT_MODELS_ARTIFACT_TTL_DAYS")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .unwrap_or(DEFAULT_ARTIFACT_TTL_DAYS);
+        if days > 0 {
+            let _ = cleanup_expired_artifacts_in(&base, Duration::from_secs(days * 86_400));
         }
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            let mut builder = fs::DirBuilder::new();
-            builder.recursive(true).mode(0o700);
-            builder.create(&base)?;
-        }
-        Err(e) => return Err(e),
-    }
+    });
     Ok(base)
 }
 
-/// Open an owner-only (`0o600`, `O_NOFOLLOW`) artifact writer under `/tmp/ext-models`.
+/// Remove regular artifact files in `dir` whose `modified` timestamp is older than `max_age`.
+pub fn cleanup_expired_artifacts_in(dir: &Path, max_age: Duration) -> usize {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return 0;
+    };
+    let now = SystemTime::now();
+    let mut removed = 0usize;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(meta) = fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if !meta.file_type().is_file() {
+            continue;
+        }
+        let expired = meta
+            .modified()
+            .ok()
+            .and_then(|m| now.duration_since(m).ok())
+            .is_some_and(|age| age >= max_age);
+        if expired && fs::remove_file(&path).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
+
+/// Remove regular artifact files under `<temp_dir>/ext-models` older than `max_age`.
+pub fn cleanup_expired_artifacts(max_age: Duration) -> usize {
+    let Ok(dir) = artifact_dir() else {
+        return 0;
+    };
+    cleanup_expired_artifacts_in(&dir, max_age)
+}
+
+/// Open an owner-only (`0o600`, `O_NOFOLLOW` on Unix) artifact writer under `<temp_dir>/ext-models`.
 pub fn open_artifact_writer(filename: &str) -> Result<(PathBuf, fs::File), String> {
     let dir = artifact_dir().map_err(|e| format!("artifact_dir error: {e}"))?;
     let path = dir.join(filename);
-    let file = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(&path)
+    let file = sys::open_secure_writer(&path)
         .map_err(|e| format!("failed to open artifact {}: {e}", path.display()))?;
     Ok((path, file))
 }

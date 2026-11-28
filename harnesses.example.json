@@ -1,6 +1,26 @@
 {
   "harnesses": [
     {
+      "id": "deepseek",
+      "binary": "deepseek-cli",
+      "strengths": "DeepSeek R1 reasoning, math, and algorithm synthesis",
+      "args": ["chat", "--model", "{model}"],
+      "plan_flags": [],
+      "write_flags": [],
+      "full_flags": [],
+      "prompt_via_stdin": true
+    },
+    {
+      "id": "kimi",
+      "binary": "kimi",
+      "strengths": "Long-context repository comprehension and multi-file analysis",
+      "args": ["--quiet", "--model", "{model}"],
+      "plan_flags": [],
+      "write_flags": ["--yolo"],
+      "full_flags": ["--yolo"],
+      "prompt_via_stdin": true
+    },
+    {
       "id": "opencode",
       "binary": "opencode",
       "strengths": "OpenCode headless CLI agent",

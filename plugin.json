@@ -1,12 +1,12 @@
 {
   "name": "external-model-subagents",
-  "displayName": "External Model Subagents (Rust Hub)",
-  "version": "2.0.0",
-  "description": "Heap-bounded Rust MCP hub for orchestrating Codex, Claude Code, Trae, ZCode, and custom CLI harnesses with provider-safe routing and isolated git worktrees.",
+  "displayName": "External Model Subagents (Rust Swarm Hub)",
+  "version": "3.0.0",
+  "description": "Heap-bounded pure-std Rust MCP hub for orchestrating Codex, Claude Code, Trae, ZCode, DeepSeek, Kimi, Pi, and custom CLI/HTTP harnesses with Panel/Pipeline/Debate swarms and isolated git worktrees.",
   "repository": "https://github.com/pxxqc2t7bp-arch/external-model-subagents",
   "suggestedPrompts": [
-    "Check available external harnesses, providers, and models with status",
-    "Ask Codex to run an adversarial review on uncommitted git changes",
-    "Run Codex and Claude in parallel to diagnose the root cause of this bug"
+    "Check available external harnesses, models, and runtime metrics with status",
+    "Run a Panel swarm across Codex and Claude to audit uncommitted git changes",
+    "Run a Debate swarm (proposer vs challenger + judge) on this architecture design"
   ]
 }

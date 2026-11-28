@@ -5,6 +5,7 @@
 //! - Enterprise/custom Model Gateways (LiteLLM, OneAPI, OpenRouter, Bedrock, Vertex)
 //! - Zero secret leakage: never reads or emits API keys, tokens, or private URLs.
 
+use crate::error::{ErrorKind, RichError};
 use crate::harness::discovery::{bins, home_dir};
 use crate::stream::{artifact_dir, write_artifact};
 use serde_json::Value;
@@ -35,11 +36,24 @@ pub struct ResolvedRoute {
 }
 
 pub fn scan_inventories(cwd: &Path, probe_trae: bool) -> BTreeMap<String, HarnessInventory> {
+    scan_registered_inventories(cwd, probe_trae, &super::registry())
+}
+
+pub(super) fn scan_registered_inventories(
+    cwd: &Path,
+    probe_trae: bool,
+    adapters: &[Box<dyn super::HarnessAdapter>],
+) -> BTreeMap<String, HarnessInventory> {
     let mut map = BTreeMap::new();
     map.insert("codex".into(), scan_codex());
     map.insert("claude".into(), scan_claude(cwd));
     map.insert("trae".into(), scan_trae(probe_trae));
     map.insert("zcode".into(), scan_zcode());
+    for adapter in adapters {
+        if let Some(inv) = adapter.model_inventory() {
+            map.insert(adapter.id().into(), inv);
+        }
+    }
     apply_user_model_overrides(&mut map);
     map
 }
@@ -55,6 +69,25 @@ pub fn resolve_route(
     inventories: &BTreeMap<String, HarnessInventory>,
     available_harnesses: &BTreeSet<String>,
 ) -> Result<ResolvedRoute, String> {
+    resolve_route_rich(
+        requested_harness,
+        requested_provider,
+        requested_model,
+        is_review,
+        inventories,
+        available_harnesses,
+    )
+    .map_err(|e| e.to_string())
+}
+
+pub fn resolve_route_rich(
+    requested_harness: Option<&str>,
+    requested_provider: Option<&str>,
+    requested_model: Option<&str>,
+    is_review: bool,
+    inventories: &BTreeMap<String, HarnessInventory>,
+    available_harnesses: &BTreeSet<String>,
+) -> Result<ResolvedRoute, RichError> {
     let norm_harness = requested_harness
         .map(str::trim)
         .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("auto"))
@@ -62,10 +95,11 @@ pub fn resolve_route(
 
     if let Some(ref h) = norm_harness {
         if !available_harnesses.contains(h) {
-            return Err(format!(
-                "harness '{h}' is not installed or ready on this machine (available: {:?})",
-                available_harnesses
-            ));
+            return Err(RichError::new(
+                ErrorKind::HarnessUnavailable,
+                format!("harness '{h}' is not installed or ready on this machine"),
+            )
+            .with_suggestion(format!("Available harnesses: {:?}", available_harnesses)));
         }
     }
 
@@ -100,9 +134,10 @@ pub fn resolve_route(
             if is_review && available_harnesses.contains("codex") {
                 "codex".into()
             } else {
-                ["codex", "claude", "trae", "zcode"]
+                ["codex", "claude", "trae", "zcode", "deepseek", "kimi", "pi"]
                     .into_iter()
                     .find(|id| available_harnesses.contains(*id))
+                    .or_else(|| available_harnesses.first().map(String::as_str))
                     .unwrap_or("codex")
                     .to_string()
             }
@@ -145,15 +180,25 @@ pub fn resolve_route(
             });
         }
 
-        // Check if user hit a dangerous cross-version mismatch (e.g. asked Claude for 5.4-pro when Claude only has 5.2-pro).
-        if let Some(near_miss) = find_version_mismatch_hint(&query_model, inv) {
-            let exact_elsewhere = find_exact_across_all(&query_model, inventories, available_harnesses);
+        // Check if user hit a dangerous cross-version mismatch INSIDE the targeted provider scope.
+        if let Some(near_miss) = find_version_mismatch_hint(&query_model, prov_opt.as_deref(), inv)
+        {
+            let exact_elsewhere =
+                find_exact_across_all(&query_model, inventories, available_harnesses);
             let hint = exact_elsewhere
-                .map(|(eh, ep, em)| format!("; exact match is on harness='{eh}' (provider='{ep}', model='{em}')"))
-                .unwrap_or_default();
-            return Err(format!(
-                "model '{query_model}' is not in '{h}' catalog (closest version mismatch: '{near_miss}' — refusing silent version downgrade{hint})"
-            ));
+                .map(|(eh, ep, em)| {
+                    format!("Exact match available on harness='{eh}', provider='{ep}', model='{em}'")
+                })
+                .unwrap_or_else(|| {
+                    format!("Specify an explicit gateway provider on '{h}' if '{query_model}' is uncached")
+                });
+            return Err(RichError::new(
+                ErrorKind::RoutingMismatch,
+                format!(
+                    "model '{query_model}' is not in '{h}' catalog (closest version mismatch: '{near_miss}' — refusing silent version downgrade)"
+                ),
+            )
+            .with_suggestion(hint));
         }
 
         // Pass through verbatim for uncached enterprise gateways (LiteLLM / OneAPI / new releases).
@@ -206,9 +251,14 @@ pub fn resolve_route(
         });
     }
 
-    Err(format!(
-        "could not auto-route model '{query_model}' across local catalogs; specify `harness` explicitly to pass through to a custom gateway"
-    ))
+    Err(RichError::new(
+        ErrorKind::RoutingMismatch,
+        format!("could not auto-route model '{query_model}' across local catalogs"),
+    )
+    .with_suggestion(format!(
+        "Specify `harness` explicitly (available: {:?}) to pass '{query_model}' through to a gateway",
+        available_harnesses
+    )))
 }
 
 pub fn canonical_harness_id(raw: &str) -> String {
@@ -217,6 +267,9 @@ pub fn canonical_harness_id(raw: &str) -> String {
         "claude" | "claude-code" | "claude_code" => "claude".into(),
         "trae" | "traecli" | "trae-agent" => "trae".into(),
         "zcode" | "zcode-agent" => "zcode".into(),
+        "deepseek-cli" => "deepseek".into(),
+        "kimi-cli" => "kimi".into(),
+        "inflection" => "pi".into(),
         other => other.to_string(),
     }
 }
@@ -225,7 +278,7 @@ pub fn canonical_harness_id(raw: &str) -> String {
 
 const CHANNEL_PREFIXES: &[&str] = &[
     "claude", "openai", "anthropic", "gateway", "proxy", "ark", "byteplus", "standard",
-    "coding", "agent", "plan", "doubao",
+    "coding", "agent", "plan", "doubao", "ferry",
 ];
 
 fn split_version_and_words(s: &str) -> (Vec<String>, Vec<String>, bool) {
@@ -342,7 +395,11 @@ fn match_in_inventory(
     best.map(|(p, m, _)| (p, m))
 }
 
-fn find_version_mismatch_hint(query: &str, inv: &HarnessInventory) -> Option<String> {
+fn find_version_mismatch_hint(
+    query: &str,
+    prov_filter: Option<&str>,
+    inv: &HarnessInventory,
+) -> Option<String> {
     let (q_nums, q_words, _) = split_version_and_words(query);
     if q_nums.is_empty() || q_words.is_empty() {
         return None;
@@ -354,7 +411,12 @@ fn find_version_mismatch_hint(query: &str, inv: &HarnessInventory) -> Option<Str
     if distinctive.is_empty() {
         return None;
     }
-    for models in inv.providers.values() {
+    for (prov, models) in &inv.providers {
+        if let Some(pf) = prov_filter {
+            if !prov.eq_ignore_ascii_case(pf) {
+                continue;
+            }
+        }
         for m in models {
             let (m_nums, m_words, _) = split_version_and_words(m);
             if m_nums != q_nums && distinctive.iter().all(|dw| m_words.contains(dw)) {
@@ -386,7 +448,6 @@ fn score_candidate(harness: &str, model_id: &str, query: &str, is_review: bool) 
         s += 30;
     }
     let ml = model_id.to_ascii_lowercase();
-    let (_, _, _) = split_version_and_words(model_id);
     if is_review && harness == "codex" {
         s += 25;
     }
@@ -398,6 +459,10 @@ fn score_candidate(harness: &str, model_id: &str, query: &str, is_review: bool) 
         }
     } else if (ml.contains("seed") || ml.contains("kimi")) && harness == "trae" {
         s += 10;
+    } else if (harness == "deepseek" && ml.contains("deepseek"))
+        || (harness == "kimi" && (ml.contains("kimi") || ml.contains("moonshot")))
+    {
+        s += 15;
     }
     let (m_nums, _, _) = split_version_and_words(model_id);
     let ver_bonus: i32 = m_nums
@@ -458,12 +523,27 @@ fn scan_codex() -> HarnessInventory {
     if let Some(cat_path) = catalog_json {
         collect_json_model_slugs(&cat_path, &mut active_models);
     }
-    collect_json_model_slugs(&codex_home.join("models_cache.json"), &mut active_models);
 
-    inv.providers
-        .entry(active_prov)
-        .or_default()
-        .extend(active_models);
+    let mut oauth_models = BTreeSet::new();
+    collect_json_model_slugs(&codex_home.join("models_cache.json"), &mut oauth_models);
+    if has_openai_auth {
+        let oa = inv.providers.entry("openai".into()).or_default();
+        for m in &oauth_models {
+            if !oa.contains(m) {
+                oa.push(m.clone());
+            }
+        }
+    }
+    if active_prov == "openai" {
+        active_models.extend(oauth_models);
+    }
+
+    let entry = inv.providers.entry(active_prov).or_default();
+    for m in active_models {
+        if !entry.contains(&m) {
+            entry.push(m);
+        }
+    }
     inv
 }
 
