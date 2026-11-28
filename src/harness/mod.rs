@@ -13,7 +13,7 @@ use crate::alloc_cap::heap_stats_kb;
 use crate::harness::catalog::{
     canonical_harness_id, resolve_route, scan_inventories, HarnessInventory,
 };
-use crate::sandbox::{git_diff_stat, run_supervised, CommandSpec, WorktreeSession};
+use crate::sandbox::{git_diff_stat, run_supervised_bounded, CommandSpec, WorktreeSession};
 use crate::stream::{
     next_call_id, persist_and_budget, read_file_capped, read_handoff, TailBuffer, DEFAULT_MAX_CHARS,
 };
@@ -24,7 +24,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WorkMode {
@@ -170,14 +170,41 @@ pub trait HarnessAdapter: Send + Sync {
     ) {
     }
 
+    /// Maximum bytes retained per single stdout line for this harness.
+    fn max_stdout_line_bytes(&self) -> usize {
+        crate::stream::MAX_LINE_BYTES
+    }
+
     /// Consume a single bounded stdout line in `O(1)` memory.
     fn on_stdout_line(&self, line: &str, state: &mut ParseState);
+
+    /// Consume a single bounded stdout line along with its line-truncation status.
+    fn on_stdout_line_bounded(&self, line: &str, _truncated: bool, state: &mut ParseState) {
+        self.on_stdout_line(line, state);
+    }
 }
 
 static LAST_SESSIONS: OnceLock<Mutex<HashMap<(String, PathBuf), String>>> = OnceLock::new();
+type InvCacheEntry = Option<(Instant, PathBuf, Arc<BTreeMap<String, HarnessInventory>>)>;
+static INV_CACHE: OnceLock<Mutex<InvCacheEntry>> = OnceLock::new();
 
 fn session_table() -> &'static Mutex<HashMap<(String, PathBuf), String>> {
     LAST_SESSIONS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Serializes and caches `scan_inventories` briefly (5s) so concurrent `tools/call` bursts
+/// never parse catalog JSON files simultaneously on multiple threads under tight heap caps.
+fn cached_inventories(cwd: &Path) -> Arc<BTreeMap<String, HarnessInventory>> {
+    let lock = INV_CACHE.get_or_init(|| Mutex::new(None));
+    let mut guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((ts, ref cached_cwd, ref arc_map)) = *guard {
+        if cached_cwd == cwd && ts.elapsed() < Duration::from_secs(5) {
+            return Arc::clone(arc_map);
+        }
+    }
+    let fresh = Arc::new(scan_inventories(cwd, false));
+    *guard = Some((Instant::now(), cwd.to_path_buf(), Arc::clone(&fresh)));
+    fresh
 }
 
 pub fn registry() -> Vec<Box<dyn HarnessAdapter>> {
@@ -245,16 +272,20 @@ pub fn execute_dispatch(args: &Value, cancel: Arc<AtomicBool>) -> (bool, String)
         return (true, "`prompt` (or `review_base`) is required.".into());
     }
 
-    let cwd = args
+    let raw_cwd = args
         .get("cwd")
         .and_then(Value::as_str)
         .filter(|s| !s.trim().is_empty())
         .map(PathBuf::from)
         .or_else(|| std::env::current_dir().ok())
         .unwrap_or_else(|| PathBuf::from("."));
-    if !cwd.is_dir() {
-        return (true, format!("working directory does not exist: {}", cwd.display()));
+    if !raw_cwd.is_dir() {
+        return (
+            true,
+            format!("working directory does not exist: {}", raw_cwd.display()),
+        );
     }
+    let cwd = fs::canonicalize(&raw_cwd).unwrap_or(raw_cwd);
 
     let mode = WorkMode::parse(args.get("mode").and_then(Value::as_str));
     let project_rules = ProjectRulesMode::parse(args.get("project_rules").and_then(Value::as_str));
@@ -288,11 +319,12 @@ pub fn execute_dispatch(args: &Value, cancel: Arc<AtomicBool>) -> (bool, String)
         .and_then(Value::as_u64)
         .unwrap_or(300_000)
         .clamp(5_000, 3_600_000);
+    let idle_floor = 10_000_u64.min(timeout_ms);
     let idle_timeout_ms = args
         .get("idle_timeout_ms")
         .and_then(Value::as_u64)
         .unwrap_or(180_000)
-        .clamp(10_000, timeout_ms);
+        .clamp(idle_floor, timeout_ms);
     let total_max_chars = args
         .get("max_chars")
         .and_then(Value::as_u64)
@@ -311,7 +343,7 @@ pub fn execute_dispatch(args: &Value, cancel: Arc<AtomicBool>) -> (bool, String)
         .filter(|a| a.is_available())
         .map(|a| a.id().to_string())
         .collect();
-    let inventories = Arc::new(scan_inventories(&cwd, false));
+    let inventories = cached_inventories(&cwd);
 
     let per_target_budget = (total_max_chars / targets.len().max(1)).max(800);
     let multi = targets.len() > 1;
@@ -354,8 +386,7 @@ pub fn execute_dispatch(args: &Value, cancel: Arc<AtomicBool>) -> (bool, String)
         let inv_c = Arc::clone(&inventories);
         let av_c = available.clone();
         let can_c = Arc::clone(&cancel);
-        // If writing in parallel across multiple targets, isolate each in its own worktree automatically
-        // when inside a git repo and worktree was requested.
+        // Forward requested worktree isolation flag to each parallel target worker.
         let wt_c = worktree;
 
         let handle = thread::Builder::new()
@@ -443,6 +474,19 @@ fn run_single_target(
         return (true, format!("unknown harness '{}'", route.harness));
     };
 
+    if worktree
+        && review_base.as_deref().is_some_and(|b| {
+            b.eq_ignore_ascii_case("uncommitted") || b.eq_ignore_ascii_case("working")
+        })
+    {
+        return (
+            true,
+            "worktree=true cannot be combined with review_base='uncommitted' \
+             (worktree snapshots dirty state into a baseline commit; run read-only uncommitted review without worktree)"
+                .into(),
+        );
+    }
+
     let call_id = next_call_id();
     let wt_session = if worktree {
         match WorktreeSession::create(cwd, &call_id) {
@@ -470,7 +514,7 @@ fn run_single_target(
         Ok(pair) => pair,
         Err(e) => {
             if let Some(ws) = wt_session {
-                let _ = ws.finalize();
+                ws.abort();
             }
             return (true, e);
         }
@@ -514,7 +558,7 @@ fn run_single_target(
         Ok(s) => s,
         Err(e) => {
             if let Some(ws) = wt_session {
-                let _ = ws.finalize();
+                ws.abort();
             }
             return (true, e);
         }
@@ -526,17 +570,18 @@ fn run_single_target(
     adapter.apply_capabilities(capabilities, inv, &exec_cwd, &mut spec);
 
     let mut state = ParseState::new();
-    let outcome = match run_supervised(
+    let outcome = match run_supervised_bounded(
         &spec,
         Duration::from_millis(timeout_ms),
         Duration::from_millis(idle_timeout_ms),
+        adapter.max_stdout_line_bytes(),
         cancel,
-        |line, _trunc| adapter.on_stdout_line(line, &mut state),
+        |line, trunc| adapter.on_stdout_line_bounded(line, trunc, &mut state),
     ) {
         Ok(o) => o,
         Err(e) => {
             if let Some(ws) = wt_session {
-                let _ = ws.finalize();
+                ws.abort();
             }
             return (true, e);
         }
@@ -547,7 +592,7 @@ fn run_single_target(
         .output_file
         .as_ref()
         .and_then(|p| {
-            let txt = fs::read_to_string(p).ok();
+            let txt = read_file_capped(p, 2 * 1024 * 1024).ok();
             let _ = fs::remove_file(p);
             txt
         })
@@ -558,12 +603,6 @@ fn run_single_target(
         .or_else(|| state.last_message.take())
         .unwrap_or_else(|| state.raw_tail.as_str().to_string());
 
-    if let Some(ref sid) = state.session_id {
-        if let Ok(mut tbl) = session_table().lock() {
-            tbl.insert((route.harness.clone(), cwd.to_path_buf()), sid.clone());
-        }
-    }
-
     let wt_summary = wt_session.map(|ws| ws.finalize());
     let direct_diff = if wt_summary.is_none() && mode != WorkMode::Plan {
         git_diff_stat(&exec_cwd)
@@ -571,11 +610,23 @@ fn run_single_target(
         None
     };
 
+    let export_failed = wt_summary
+        .as_ref()
+        .is_some_and(|w| w.export_error.is_some());
     let failed = outcome.cancelled
         || outcome.timed_out
         || outcome.idle_timed_out
         || state.is_error
-        || outcome.exit_code != 0;
+        || outcome.exit_code != 0
+        || export_failed;
+
+    if keep_session && !failed {
+        if let Some(ref sid) = state.session_id {
+            if let Ok(mut tbl) = session_table().lock() {
+                tbl.insert((route.harness.clone(), cwd.to_path_buf()), sid.clone());
+            }
+        }
+    }
 
     let mut full_body = if raw_reply.trim().is_empty() {
         if failed {
@@ -627,14 +678,28 @@ fn run_single_target(
     out.push_str(&budgeted_body);
 
     if let Some(wt) = wt_summary {
-        if !wt.diff_stat.is_empty() {
-            out.push_str(&format!("\n\n[worktree diff]\n{}", wt.diff_stat));
-        }
-        if let Some(pp) = wt.patch_path {
+        if wt.skipped_untracked > 0 {
             out.push_str(&format!(
-                "\n[patch ready: `git apply {}`]",
-                pp.display()
+                "\n\n[worktree note: skipped {} untracked item(s) (symlinks, >2 MiB, or >50 file cap)]",
+                wt.skipped_untracked
             ));
+        }
+        if let Some(err) = wt.export_error {
+            let kept = wt
+                .preserved_worktree
+                .map(|p| format!("; checkout preserved at {}", p.display()))
+                .unwrap_or_default();
+            out.push_str(&format!("\n\n[worktree export error: {err}{kept}]"));
+        } else {
+            if !wt.diff_stat.is_empty() {
+                out.push_str(&format!("\n\n[worktree diff]\n{}", wt.diff_stat));
+            }
+            if let Some(pp) = wt.patch_path {
+                out.push_str(&format!(
+                    "\n[patch ready: `git apply {}`]",
+                    pp.display()
+                ));
+            }
         }
     } else if let Some(st) = direct_diff {
         out.push_str(&format!("\n\n[workspace git status]\n{st}"));

@@ -161,10 +161,28 @@ impl HarnessAdapter for ClaudeAdapter {
         }
     }
 
+    fn max_stdout_line_bytes(&self) -> usize {
+        // Claude `-p --output-format json` emits the full response on a single JSON line.
+        // Scale to 1/8 of the configured hard heap ceiling (2 MiB at default 16 MiB, 512 KiB at 4 MiB floor).
+        (crate::alloc_cap::hard_limit_bytes() / 8).clamp(256 * 1024, 2 * 1024 * 1024)
+    }
+
     fn on_stdout_line(&self, line: &str, state: &mut ParseState) {
+        self.on_stdout_line_bounded(line, false, state);
+    }
+
+    fn on_stdout_line_bounded(&self, line: &str, truncated: bool, state: &mut ParseState) {
         let trimmed = line.trim();
         if !trimmed.starts_with('{') {
             state.raw_tail.push_line(trimmed);
+            return;
+        }
+        if truncated {
+            state.is_error = true;
+            state.last_message = Some(format!(
+                "[error: claude JSON output exceeded {}-byte line cap and was truncated]",
+                self.max_stdout_line_bytes()
+            ));
             return;
         }
         if let Ok(v) = serde_json::from_str::<Value>(trimmed) {

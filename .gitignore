@@ -1,6 +1,7 @@
 /target
 /bin/
 /log/
+/.build/
 .DS_Store
 ._*
 harnesses.json

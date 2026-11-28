@@ -36,12 +36,13 @@ pub fn serve_stdio() -> i32 {
     }
 
     // Host closed stdin: abort all running child process groups so zero orphans remain.
+    // Wait long enough (> 2s) for `terminate_process_group` SIGTERM -> SIGKILL escalation.
     active.cancel_all();
-    for _ in 0..15 {
+    for _ in 0..30 {
         if active.is_empty() {
             break;
         }
-        thread::sleep(Duration::from_millis(40));
+        thread::sleep(Duration::from_millis(80));
     }
     0
 }
@@ -175,29 +176,38 @@ fn spawn_tool_call(id: Value, params: Value, writer: &RpcWriter, active: &Active
                     });
             }
 
-            let (is_err, text) = match tool_name.as_str() {
-                "dispatch" => execute_dispatch(&args, cancel_flag),
-                "status" => {
-                    let cwd = args
-                        .get("cwd")
-                        .and_then(Value::as_str)
-                        .map(PathBuf::from)
-                        .or_else(|| std::env::current_dir().ok())
-                        .unwrap_or_else(|| PathBuf::from("."));
-                    (false, build_status_report(&cwd, true))
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                match tool_name.as_str() {
+                    "dispatch" => execute_dispatch(&args, cancel_flag),
+                    "status" => {
+                        let cwd = args
+                            .get("cwd")
+                            .and_then(Value::as_str)
+                            .map(PathBuf::from)
+                            .or_else(|| std::env::current_dir().ok())
+                            .unwrap_or_else(|| PathBuf::from("."));
+                        (false, build_status_report(&cwd, true))
+                    }
+                    other => (true, format!("Unknown tool: {other}")),
                 }
-                other => (true, format!("Unknown tool: {other}")),
-            };
+            }));
 
             hb_done.store(true, Ordering::Release);
             active_c.remove(&req_key);
-            writer_c.send_result(
-                id_worker,
-                json!({
-                    "content": [{ "type": "text", "text": text }],
-                    "isError": is_err
-                }),
-            );
+            match outcome {
+                Ok((is_err, text)) => {
+                    writer_c.send_result(
+                        id_worker,
+                        json!({
+                            "content": [{ "type": "text", "text": text }],
+                            "isError": is_err
+                        }),
+                    );
+                }
+                Err(_) => {
+                    writer_c.send_error(id_worker, -32603, "internal worker panic");
+                }
+            }
         });
 
     if let Err(e) = res {

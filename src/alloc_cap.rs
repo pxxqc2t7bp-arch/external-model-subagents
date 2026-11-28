@@ -39,6 +39,11 @@ pub fn heap_stats_kb() -> (usize, usize, usize) {
     (cur, peak, limit)
 }
 
+/// Returns the configured hard heap ceiling in bytes.
+pub fn hard_limit_bytes() -> usize {
+    LIMIT_BYTES.load(Ordering::Relaxed)
+}
+
 /// True when live heap usage reaches or exceeds 70% of the configured hard limit.
 pub fn is_near_soft_limit() -> bool {
     let cur = CURRENT_BYTES.load(Ordering::Relaxed);

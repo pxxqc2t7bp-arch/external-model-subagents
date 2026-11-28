@@ -1,8 +1,8 @@
 //! Structurally bounded, UTF-8 safe line reader, ring tail buffer, and zero-copy handoff store.
 
 use std::fs::{self, OpenOptions};
-use std::io::{self, BufRead, Write};
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+use std::io::{self, BufRead, Read, Write};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -19,30 +19,66 @@ pub fn next_call_id() -> String {
     format!("c{}_{}", std::process::id(), seq)
 }
 
-/// Ensure `/tmp/ext-models` exists with owner-only `0o700` permissions.
+/// Ensure `/tmp/ext-models` exists as a non-symlink directory owned by the current UID (`0o700`).
 pub fn artifact_dir() -> io::Result<PathBuf> {
     let base = std::env::temp_dir().join("ext-models");
-    if !base.exists() {
-        let mut builder = fs::DirBuilder::new();
-        builder.recursive(true).mode(0o700);
-        builder.create(&base)?;
+    match fs::symlink_metadata(&base) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() || !meta.file_type().is_dir() {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!("artifact path {} is not a real directory", base.display()),
+                ));
+            }
+            let uid = unsafe { libc::geteuid() };
+            if meta.uid() != uid {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!("artifact directory {} is not owned by current user", base.display()),
+                ));
+            }
+            if meta.permissions().mode() & 0o777 != 0o700 {
+                let _ = fs::set_permissions(&base, fs::Permissions::from_mode(0o700));
+            }
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            let mut builder = fs::DirBuilder::new();
+            builder.recursive(true).mode(0o700);
+            builder.create(&base)?;
+        }
+        Err(e) => return Err(e),
     }
     Ok(base)
 }
 
-/// Write an owner-only (`0o600`) artifact file under `/tmp/ext-models`.
-pub fn write_artifact(filename: &str, content: &str) -> Option<PathBuf> {
-    let dir = artifact_dir().ok()?;
+/// Open an owner-only (`0o600`, `O_NOFOLLOW`) artifact writer under `/tmp/ext-models`.
+pub fn open_artifact_writer(filename: &str) -> Result<(PathBuf, fs::File), String> {
+    let dir = artifact_dir().map_err(|e| format!("artifact_dir error: {e}"))?;
     let path = dir.join(filename);
-    let mut file = OpenOptions::new()
+    let file = OpenOptions::new()
         .create(true)
         .write(true)
         .truncate(true)
         .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
         .open(&path)
-        .ok()?;
-    file.write_all(content.as_bytes()).ok()?;
-    Some(path)
+        .map_err(|e| format!("failed to open artifact {}: {e}", path.display()))?;
+    Ok((path, file))
+}
+
+/// Write raw bytes to an owner-only (`0o600`, `O_NOFOLLOW`) artifact file under `/tmp/ext-models`.
+pub fn write_artifact_bytes(filename: &str, content: &[u8]) -> Result<PathBuf, String> {
+    let (path, mut file) = open_artifact_writer(filename)?;
+    file.write_all(content)
+        .map_err(|e| format!("failed to write artifact {}: {e}", path.display()))?;
+    file.flush()
+        .map_err(|e| format!("failed to flush artifact {}: {e}", path.display()))?;
+    Ok(path)
+}
+
+/// Write an owner-only (`0o600`) UTF-8 artifact file under `/tmp/ext-models`.
+pub fn write_artifact(filename: &str, content: &str) -> Option<PathBuf> {
+    write_artifact_bytes(filename, content.as_bytes()).ok()
 }
 
 /// Resolve a `handoff_from` call ID (e.g. `"c1234_1"`) to its saved Markdown artifact content.
@@ -74,14 +110,21 @@ pub fn read_handoff(call_id: &str, max_bytes: usize) -> Result<String, String> {
     read_file_capped(&target, max_bytes)
 }
 
-/// Read a local context file capped at `max_bytes` on a valid UTF-8 boundary.
+/// Read a local context file capped at `max_bytes` on a valid UTF-8 boundary without loading
+/// the entire file into memory first.
 pub fn read_file_capped(path: &Path, max_bytes: usize) -> Result<String, String> {
-    let bytes = fs::read(path).map_err(|e| format!("failed to read {}: {e}", path.display()))?;
+    let file =
+        fs::File::open(path).map_err(|e| format!("failed to read {}: {e}", path.display()))?;
+    let mut bytes = Vec::with_capacity(max_bytes.min(64 * 1024));
+    file.take((max_bytes as u64).saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("failed to read {}: {e}", path.display()))?;
     if bytes.len() <= max_bytes {
         return Ok(String::from_utf8_lossy(&bytes).into_owned());
     }
-    let s = String::from_utf8_lossy(&bytes[..max_bytes]);
-    let mut clean = s.into_owned();
+    bytes.truncate(max_bytes);
+    trim_incomplete_utf8_tail(&mut bytes);
+    let mut clean = String::from_utf8_lossy(&bytes).into_owned();
     clean.push_str("\n...[truncated file context]...");
     Ok(clean)
 }
@@ -130,6 +173,9 @@ pub fn read_bounded_line<R: BufRead>(
 }
 
 fn append_capped(dst: &mut Vec<u8>, src: &[u8], max_bytes: usize, truncated: &mut bool) {
+    if src.is_empty() {
+        return;
+    }
     if dst.len() < max_bytes {
         let remain = max_bytes - dst.len();
         if src.len() <= remain {
